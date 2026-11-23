@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  var VERSION = "2026-11-24 01:00";
+  var VERSION = "2026-11-24 01:15";
 
   /* ============================================================
    * 接続の設定（?c= か、この端末に保存したもの）
@@ -178,6 +178,9 @@
     playerStatus: 'idle',       // 'idle' | 'loading' | 'playing' | 'paused'
     loopMode: false,
     playbackRate: 1.0,
+    listeningLogs: [],          // 聞き取りの理解度の記録（シート ListeningLog）
+    listeningWriteAt: 0,        // 最後に記録を足した・消した時刻（それより古い読み込みの返事で上書きしない）
+    llForm: { kind: 'archive', subtitles: 'none', mainCause: '' },
     cardAutoAudio: true,        // 単語練習で、次のカードを出したら音声を自動で流す（端末ごとに保存）
     cardAutoAudioArm: false,    // タップで次のカードに進んだときだけ true（裏での描き直しでは鳴らさない）
 
@@ -191,7 +194,7 @@
     isExtracting: false
   };
 
-  var SPEED_STEPS = [0.75, 0.85, 1.0, 1.25];
+  var SPEED_STEPS = [0.75, 0.85, 1.0, 1.1, 1.25];
   var ALLOWED_LEVELS = { Basic: true, Natural: true, Slang: true };
   var ALLOWED_STATUSES = { done: true, processing: true, waiting_captions: true, queued: true, error: true, skipped: true };
   var ALLOWED_REGISTERS = { Everyday: true, Casual: true, 'Internet-Only': true };
@@ -1572,6 +1575,328 @@
   }
 
   /* ============================================================
+   * 聞き取りの理解度（記録タブ）
+   * アーカイブなどを止めずに聞いて、分かった割合を残す。字幕なしの回を主な線にする。
+   * ============================================================ */
+  var LL_KIND_LABEL = { archive: 'アーカイブ', live: 'ライブ' };
+  var LL_SUB_LABEL = { none: '字幕なし', en: '英語字幕' };
+  var LL_CAUSE_LABEL = { vocab: '知らない語', sound: '音で分からない', speed: '速くて追えない' };
+  var LL_CAUSE_TIP = {
+    vocab: '単語カードを先に進めると効きます。',
+    sound: '穴埋めモードで、音とつづりを結びつけましょう。',
+    speed: '長文のシャドーイングを 1.1x でも練習しましょう。'
+  };
+  // 段階の目安（字幕なし・直近3回の平均）。ロードマップの区切りに合わせる
+  var LL_STAGES = [
+    { max: 30, n: 1, name: '頻出表現を音で覚える' },
+    { max: 60, n: 2, name: '短い区間を全部聞き取る' },
+    { max: 70, n: 3, name: 'アーカイブを止めずに聞く' },
+    { max: 101, n: 4, name: 'ライブに挑戦' }
+  ];
+  var LL_LIVE_TARGET = 70;
+
+  function llShortDate(d) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
+    return m ? (parseInt(m[2], 10) + '/' + parseInt(m[3], 10)) : String(d || '');
+  }
+  function llDayNum(d) {
+    var t = Date.parse(String(d) + 'T00:00:00Z');
+    return isNaN(t) ? 0 : Math.round(t / 86400000);
+  }
+  function llTodayStr() {
+    var n = new Date();
+    var p = function (x) { return (x < 10 ? '0' : '') + x; };
+    return n.getFullYear() + '-' + p(n.getMonth() + 1) + '-' + p(n.getDate());
+  }
+  function llMeta(l) {
+    return [llShortDate(l.date), LL_KIND_LABEL[l.kind] || 'アーカイブ', LL_SUB_LABEL[l.subtitles] || '字幕なし',
+      (Number(l.minutes) || 0) + '分', (Number(l.speed) || 1) + 'x'].join(' · ');
+  }
+  function llLogs() { return Array.isArray(state.listeningLogs) ? state.listeningLogs : []; }
+
+  function renderListeningLogs() {
+    var badge = document.getElementById('listenCountBadge');
+    if (!badge) return;
+    var logs = llLogs();
+    badge.textContent = logs.length + ' 回';
+    renderListeningSummary(logs);
+    renderListeningChart();
+    renderListeningList(logs);
+  }
+
+  function renderListeningSummary(logs) {
+    var el = document.getElementById('listenSummary');
+    if (!logs.length) {
+      el.innerHTML = '<p class="helper-note listen-empty">最近のアーカイブから5分を選び、字幕なしで止めずに1回だけ聞いて、分かった割合を記録します。週に1回くらい続けると、伸びがグラフで見えます。</p>';
+      return;
+    }
+    var noSub = logs.filter(function (l) { return l.subtitles !== 'en'; });
+    var base = noSub.length ? noSub : logs;
+    var latest = base[base.length - 1];
+    var html = '<div class="listen-hero">' +
+      '<div class="listen-hero-value"><span class="num">' + Number(latest.percent) + '</span><small>%</small></div>' +
+      '<div class="listen-hero-text"><span class="listen-hero-label">最新（' + escapeHtml(LL_SUB_LABEL[latest.subtitles] || '字幕なし') + '・' + escapeHtml(llShortDate(latest.date)) + '）</span>';
+    if (base.length >= 2) {
+      var diff = Number(latest.percent) - Number(base[0].percent);
+      var cls = diff > 0 ? 'up' : (diff < 0 ? 'down' : 'flat');
+      html += '<span class="listen-delta ' + cls + '">はじめ（' + escapeHtml(llShortDate(base[0].date)) + '）から ' +
+        (diff > 0 ? '+' : (diff < 0 ? '−' : '±')) + Math.abs(diff) + '</span>';
+    }
+    html += '</div></div>';
+
+    if (noSub.length) {
+      var recent = noSub.slice(-3);
+      var avg = Math.round(recent.reduce(function (s, l) { return s + Number(l.percent); }, 0) / recent.length);
+      var stage = LL_STAGES.filter(function (s) { return avg < s.max; })[0];
+      html += '<div class="listen-stage"><span class="listen-stage-tag">いまの目安</span><div>' +
+        '<strong>段階' + stage.n + '　' + escapeHtml(stage.name) + '</strong>' +
+        '<small>字幕なし・直近' + recent.length + '回の平均 ' + avg + '%' + (stage.n < 4 ? '（ライブの目安は ' + LL_LIVE_TARGET + '%）' : '') + '</small>' +
+      '</div></div>';
+    } else {
+      html += '<p class="helper-note" style="margin:0 0 10px;">字幕なしで聞いた回を記録すると、いまの段階の目安が出ます。</p>';
+    }
+
+    var causeCount = {};
+    logs.slice(-10).forEach(function (l) { if (LL_CAUSE_LABEL[l.mainCause]) causeCount[l.mainCause] = (causeCount[l.mainCause] || 0) + 1; });
+    var causes = Object.keys(causeCount).sort(function (a, b) { return causeCount[b] - causeCount[a]; });
+    if (causes.length) {
+      html += '<div class="listen-causes"><span>多かった原因（直近10回）</span><strong>' +
+        causes.map(function (k) { return escapeHtml(LL_CAUSE_LABEL[k]) + ' ' + causeCount[k]; }).join('・') +
+        '</strong><small>' + escapeHtml(LL_CAUSE_TIP[causes[0]]) + '</small></div>';
+    }
+    el.innerHTML = html;
+  }
+
+  // 折れ線（字幕なし＝塗った点、英語字幕＝白抜きの点）。横は日付、縦は 0〜100%
+  function renderListeningChart() {
+    var wrap = document.getElementById('listenChartWrap');
+    var box = document.getElementById('listenChart');
+    var legend = document.getElementById('listenLegend');
+    var tip = document.getElementById('listenTip');
+    if (!wrap || !box) return;
+    var logs = llLogs();
+    tip.hidden = true;
+    if (!logs.length) { wrap.hidden = true; box.innerHTML = ''; legend.innerHTML = ''; return; }
+    wrap.hidden = false;
+
+    var W = Math.max(260, Math.round(box.clientWidth || 320));
+    var H = 188, padL = 30, padR = 16, padT = 16, padB = 24;
+    var pw = W - padL - padR, ph = H - padT - padB;
+    var days = logs.map(function (l) { return llDayNum(l.date); });
+    var d0 = Math.min.apply(null, days), d1 = Math.max.apply(null, days);
+    var iMin = days.indexOf(d0), iMax = days.indexOf(d1);
+    function xOf(day) { return d1 === d0 ? padL + pw / 2 : padL + ((day - d0) / (d1 - d0)) * pw; }
+    function yOf(p) { return padT + (1 - Math.max(0, Math.min(100, p)) / 100) * ph; }
+    function f(n) { return n.toFixed(1); }
+
+    var series = [
+      { key: 'none', name: '字幕なし', cls: 'a' },
+      { key: 'en', name: '英語字幕', cls: 'b' }
+    ].map(function (s) {
+      s.items = [];
+      logs.forEach(function (l, i) {
+        if ((l.subtitles === 'en' ? 'en' : 'none') === s.key) s.items.push({ log: l, idx: i, x: xOf(days[i]), y: yOf(Number(l.percent)) });
+      });
+      s.items.sort(function (a, b) { return a.x - b.x; });
+      return s;
+    }).filter(function (s) { return s.items.length; });
+
+    var svg = '<svg class="listen-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="聞き取りの理解度の移り変わり。下の「これまでの記録」に全部の値があります">';
+    [0, 25, 50, 75, 100].forEach(function (g) {
+      var y = f(yOf(g));
+      svg += '<line class="ll-grid" x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y + '" y2="' + y + '"/>';
+      if (g % 50 === 0) svg += '<text class="ll-axis" x="' + (padL - 7) + '" y="' + y + '" text-anchor="end" dominant-baseline="middle">' + g + '</text>';
+    });
+    var yT = f(yOf(LL_LIVE_TARGET));
+    svg += '<line class="ll-target" x1="' + padL + '" x2="' + (W - padR) + '" y1="' + yT + '" y2="' + yT + '"/>';
+    if (d1 === d0) {
+      svg += '<text class="ll-axis" x="' + f(padL + pw / 2) + '" y="' + (H - 6) + '" text-anchor="middle">' + escapeHtml(llShortDate(logs[iMin].date)) + '</text>';
+    } else {
+      svg += '<text class="ll-axis" x="' + padL + '" y="' + (H - 6) + '" text-anchor="start">' + escapeHtml(llShortDate(logs[iMin].date)) + '</text>';
+      svg += '<text class="ll-axis" x="' + (W - padR) + '" y="' + (H - 6) + '" text-anchor="end">' + escapeHtml(llShortDate(logs[iMax].date)) + '</text>';
+    }
+    series.forEach(function (s) {
+      if (s.items.length >= 2) {
+        svg += '<polyline class="ll-line ' + s.cls + '" points="' + s.items.map(function (p) { return f(p.x) + ',' + f(p.y); }).join(' ') + '"/>';
+      }
+    });
+    series.forEach(function (s) {
+      s.items.forEach(function (p) { svg += '<circle class="ll-dot ' + s.cls + '" cx="' + f(p.x) + '" cy="' + f(p.y) + '" r="4.5"/>'; });
+    });
+    // いちばん新しい値だけ、主な線の端に数字を出す
+    var main = series[0];
+    var last = main.items[main.items.length - 1];
+    var anchor = last.x > W - padR - 20 ? 'end' : (last.x < padL + 20 ? 'start' : 'middle');
+    var ly = last.y - 12 < padT ? last.y + 20 : last.y - 12;
+    svg += '<text class="ll-end-label" x="' + f(Math.min(W - padR + 6, last.x)) + '" y="' + f(ly) + '" text-anchor="' + anchor + '">' + Number(last.log.percent) + '%</text>';
+    // さわれる範囲は点より大きくする
+    series.forEach(function (s) {
+      s.items.forEach(function (p) {
+        svg += '<circle class="ll-hit" cx="' + f(p.x) + '" cy="' + f(p.y) + '" r="15" tabindex="0" role="button" data-ll-idx="' + p.idx + '" aria-label="' +
+          escapeHtml(llShortDate(p.log.date) + ' ' + s.name + ' ' + p.log.percent + '%') + '"/>';
+      });
+    });
+    svg += '</svg>';
+    box.innerHTML = svg;
+
+    var lg = '';
+    if (series.length >= 2) {
+      series.forEach(function (s) { lg += '<span class="ll-key"><i class="ll-key-line ' + s.cls + '"></i>' + escapeHtml(s.name) + '</span>'; });
+    }
+    lg += '<span class="ll-key"><i class="ll-key-target"></i>ライブの目安 ' + LL_LIVE_TARGET + '%</span>';
+    legend.innerHTML = lg;
+  }
+
+  function showListenTip(hitEl) {
+    var l = llLogs()[parseInt(hitEl.getAttribute('data-ll-idx'), 10)];
+    var tip = document.getElementById('listenTip');
+    var wrap = document.getElementById('listenChartWrap');
+    if (!l || !tip || !wrap) return;
+    tip.textContent = '';
+    var v = document.createElement('strong'); v.textContent = l.percent + '%';
+    var m = document.createElement('span'); m.textContent = llMeta(l);
+    tip.appendChild(v); tip.appendChild(m);
+    if (LL_CAUSE_LABEL[l.mainCause]) { var c = document.createElement('span'); c.textContent = '原因：' + LL_CAUSE_LABEL[l.mainCause]; tip.appendChild(c); }
+    if (l.memo) { var me = document.createElement('small'); me.textContent = l.memo; tip.appendChild(me); }
+    tip.hidden = false;
+    var wr = wrap.getBoundingClientRect(), hr = hitEl.getBoundingClientRect();
+    var cx = hr.left + hr.width / 2 - wr.left;
+    var left = Math.max(0, Math.min(wr.width - tip.offsetWidth, cx - tip.offsetWidth / 2));
+    var top = hr.top - wr.top - tip.offsetHeight + 6;
+    if (top < 0) top = hr.bottom - wr.top - 6;
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+
+  function renderListeningList(logs) {
+    var det = document.getElementById('listenHistory');
+    var list = document.getElementById('listenList');
+    det.hidden = !logs.length;
+    list.innerHTML = logs.slice().reverse().map(function (l) {
+      return '<div class="ll-row">' +
+        '<div class="ll-row-pct num">' + Number(l.percent) + '<small>%</small></div>' +
+        '<div class="ll-row-body"><div class="ll-row-meta">' + escapeHtml(llShortDate(l.date) + ' · ' + (LL_KIND_LABEL[l.kind] || 'アーカイブ')) + '</div>' +
+          '<div class="ll-row-sub">' + escapeHtml([LL_SUB_LABEL[l.subtitles] || '字幕なし', (Number(l.minutes) || 0) + '分', (Number(l.speed) || 1) + 'x'].join(' · ')) + '</div>' +
+          (LL_CAUSE_LABEL[l.mainCause] ? '<div class="ll-row-sub">原因：' + escapeHtml(LL_CAUSE_LABEL[l.mainCause]) + '</div>' : '') +
+          (l.memo ? '<div class="ll-row-sub">' + escapeHtml(l.memo) + '</div>' : '') +
+        '</div>' +
+        '<button class="ll-del" type="button" data-ll-del="' + escapeHtml(l.id) + '" aria-label="この記録を消す">' + ic('trash') + '</button>' +
+      '</div>';
+    }).join('');
+  }
+
+  function syncListenLogForm() {
+    var segs = document.querySelectorAll('#listenLogModal [data-ll]');
+    for (var i = 0; i < segs.length; i++) {
+      var group = segs[i].getAttribute('data-ll');
+      var btns = segs[i].querySelectorAll('[data-v]');
+      for (var j = 0; j < btns.length; j++) {
+        var on = btns[j].getAttribute('data-v') === state.llForm[group];
+        btns[j].classList.toggle('active', on);
+        btns[j].setAttribute('aria-pressed', String(on));
+      }
+    }
+    var r = document.getElementById('llPercent');
+    document.getElementById('llPercentOut').textContent = r.value;
+    r.style.setProperty('--pct', r.value + '%');
+  }
+
+  function openListenLogForm() {
+    state.llForm = { kind: 'archive', subtitles: 'none', mainCause: '' };
+    document.getElementById('llPercent').value = '50';
+    document.getElementById('llMinutes').value = '5';
+    document.getElementById('llSpeed').value = '1';
+    document.getElementById('llMemo').value = '';
+    document.getElementById('llDate').value = llTodayStr();
+    syncListenLogForm();
+    setModalOpen(document.getElementById('listenLogModal'), true);
+  }
+
+  function bindListeningLogEvents() {
+    var modal = document.getElementById('listenLogModal');
+    document.getElementById('openListenLogBtn').addEventListener('click', openListenLogForm);
+    document.getElementById('listenLogClose').addEventListener('click', function () { setModalOpen(modal, false); });
+    modal.addEventListener('click', function (ev) { if (ev.target === this) setModalOpen(modal, false); });
+    document.getElementById('llPercent').addEventListener('input', syncListenLogForm);
+    modal.addEventListener('click', function (ev) {
+      var b = ev.target.closest('[data-v]');
+      var seg = b && b.closest('[data-ll]');
+      if (!seg) return;
+      state.llForm[seg.getAttribute('data-ll')] = b.getAttribute('data-v');
+      syncListenLogForm();
+    });
+
+    document.getElementById('submitListenLogBtn').addEventListener('click', function () {
+      var btn = this;
+      var entry = {
+        percent: Number(document.getElementById('llPercent').value),
+        kind: state.llForm.kind,
+        subtitles: state.llForm.subtitles,
+        mainCause: state.llForm.mainCause,
+        minutes: Number(document.getElementById('llMinutes').value) || 5,
+        speed: Number(document.getElementById('llSpeed').value) || 1,
+        memo: document.getElementById('llMemo').value.trim().slice(0, 200),
+        date: document.getElementById('llDate').value || llTodayStr()
+      };
+      btn.disabled = true;
+      callGas('apiAddListeningLog', entry)
+        .then(function (data) {
+          state.listeningLogs = data.logs || [];
+          state.listeningWriteAt = Date.now();
+          renderListeningLogs();
+          setModalOpen(modal, false);
+          showToast('記録しました');
+        })
+        .catch(function (err) { showToast('記録できませんでした：' + err.message, true); })
+        .then(function () { btn.disabled = false; });
+    });
+
+    // 消すのは2回押し（1回目で「消す」に変わり、3秒で元に戻る）
+    document.getElementById('listenList').addEventListener('click', function (ev) {
+      var btn = ev.target.closest('[data-ll-del]');
+      if (!btn || btn.disabled) return;
+      if (!btn.classList.contains('armed')) {
+        btn.classList.add('armed');
+        btn.textContent = '消す';
+        setTimeout(function () {
+          if (btn.isConnected && btn.classList.contains('armed') && !btn.disabled) { btn.classList.remove('armed'); btn.innerHTML = ic('trash'); }
+        }, 3000);
+        return;
+      }
+      btn.disabled = true;
+      callGas('apiDeleteListeningLog', btn.getAttribute('data-ll-del'))
+        .then(function (data) {
+          state.listeningLogs = data.logs || [];
+          state.listeningWriteAt = Date.now();
+          renderListeningLogs();
+          showToast('記録を消しました');
+        })
+        .catch(function (err) { btn.disabled = false; showToast('消せませんでした：' + err.message, true); });
+    });
+
+    // グラフの点をさわると、その回のくわしい内容を出す
+    var chart = document.getElementById('listenChart');
+    chart.addEventListener('click', function (ev) {
+      var hit = ev.target.closest('.ll-hit');
+      if (hit) showListenTip(hit);
+    });
+    chart.addEventListener('focusin', function (ev) {
+      if (ev.target.classList && ev.target.classList.contains('ll-hit')) showListenTip(ev.target);
+    });
+    document.addEventListener('click', function (ev) {
+      if (!ev.target.closest || !ev.target.closest('.ll-hit')) {
+        var tip = document.getElementById('listenTip');
+        if (tip) tip.hidden = true;
+      }
+    });
+    var resizeTimer = null;
+    window.addEventListener('resize', function () {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function () { if (state.activeTab === 'stats') renderListeningChart(); }, 150);
+    });
+  }
+
+  /* ============================================================
    * 単語：カード・4択・穴埋め
    * ============================================================ */
   function buildQuizOptionsForCard(card) {
@@ -2374,9 +2699,8 @@
       showToast(state.loopMode ? 'くり返し：オン' : 'くり返し：オフ');
     });
     document.getElementById('passageSpeedBtn').addEventListener('click', function () {
-      var pSteps = [0.75, 0.85, 1.0];
-      var idx = pSteps.indexOf(state.playbackRate);
-      state.playbackRate = pSteps[(idx + 1) % pSteps.length];
+      var idx = SPEED_STEPS.indexOf(state.playbackRate);
+      state.playbackRate = SPEED_STEPS[(idx + 1) % SPEED_STEPS.length];
       safeStorageSet('saba_speed', state.playbackRate);
       if (state.audioEl) state.audioEl.playbackRate = state.playbackRate;
       updatePlayerButtonsUi();
@@ -2751,6 +3075,8 @@
     document.querySelectorAll('.tab-panel').forEach(function (p) { p.classList.toggle('active', p.id === 'tab-' + tabName); });
     document.querySelectorAll('.nav-btn').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-tab') === tabName); });
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    // グラフは見えている幅に合わせて描くので、記録タブを開いたときに描き直す
+    if (tabName === 'stats') renderListeningChart();
   }
 
   function applyBootstrapData(data) {
@@ -2763,8 +3089,10 @@
     state.triggerStatus = data.triggerStatus || { enabled: false };
     state.audioFolderStatus = data.audioFolderStatus || { ready: false, folderName: 'SabaAudioClips' };
     state.seedSummary = data.seedSummary || { available: false };
+    if (Array.isArray(data.listeningLogs)) state.listeningLogs = data.listeningLogs;
 
     renderCreatorSelects();
+    renderListeningLogs();
     renderHeaderAndStats();
     renderShadowTab();
     renderLibraryStreamFilterOptions();
@@ -2811,6 +3139,8 @@
           }
           if (r.stats) data.stats = r.stats;
         });
+        // 取りに行っている間に聞き取りの記録を足した・消したなら、手元のほうが新しい
+        if (state.listeningWriteAt && state.listeningWriteAt >= startedAt) data.listeningLogs = state.listeningLogs;
         state.freshLoaded = true;
         state.bootFailed = false;
         state.lastSyncAt = Date.now();
@@ -3227,6 +3557,7 @@
     });
 
     // Modals
+    bindListeningLogEvents();
     var detailModal = document.getElementById('detailModal');
     var manualModal = document.getElementById('manualAddModal');
     function closeDetailModal() {
@@ -3241,6 +3572,7 @@
     document.addEventListener('keydown', function (ev) {
       if (ev.key === 'Escape') {
         closeDetailModal();
+        setModalOpen(document.getElementById('listenLogModal'), false);
         setModalOpen(manualModal, false);
         setModalOpen(manualPassageModal, false);
       }

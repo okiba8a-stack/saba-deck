@@ -337,6 +337,25 @@
   var todayReviewed = 7;
   var triggerEnabled = true;
 
+  // 聞き取りの理解度（作り物）。日付は今日から何日前か
+  function demoDate(daysAgo) {
+    var d = new Date(Date.now() - daysAgo * 86400000);
+    var p = function (x) { return (x < 10 ? '0' : '') + x; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+  var dbListening = [
+    { id: 'll_demo1', date: demoDate(42), kind: 'archive', subtitles: 'none', minutes: 5, speed: 1, percent: 25, mainCause: 'sound', memo: '初回テスト：雑談配信の冒頭5分', createdAt: '1' },
+    { id: 'll_demo2', date: demoDate(35), kind: 'archive', subtitles: 'en', minutes: 15, speed: 0.9, percent: 55, mainCause: 'vocab', memo: '', createdAt: '2' },
+    { id: 'll_demo3', date: demoDate(28), kind: 'archive', subtitles: 'none', minutes: 5, speed: 1, percent: 32, mainCause: 'sound', memo: '', createdAt: '3' },
+    { id: 'll_demo4', date: demoDate(21), kind: 'archive', subtitles: 'none', minutes: 5, speed: 1, percent: 38, mainCause: 'speed', memo: 'Minecraft 1:02:00〜', createdAt: '4' },
+    { id: 'll_demo5', date: demoDate(14), kind: 'archive', subtitles: 'en', minutes: 20, speed: 1, percent: 63, mainCause: 'sound', memo: '', createdAt: '5' },
+    { id: 'll_demo6', date: demoDate(7), kind: 'archive', subtitles: 'none', minutes: 5, speed: 1, percent: 45, mainCause: 'sound', memo: '', createdAt: '6' },
+    { id: 'll_demo7', date: demoDate(1), kind: 'live', subtitles: 'none', minutes: 30, speed: 1, percent: 50, mainCause: 'vocab', memo: '初めてのライブ（30分）', createdAt: '7' }
+  ];
+  function listeningSorted() {
+    return dbListening.slice().sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt < b.createdAt ? -1 : 1); });
+  }
+
   function computeStats() {
     var due = 0, mastered = 0, learning = 0, nw = 0, weak = 0;
     var byLevel = { Basic: 0, Natural: 0, Slang: 0 };
@@ -369,6 +388,21 @@
   }
 
   window.__LOCAL_MOCK_GAS__ = {
+    apiAddListeningLog: function (e) {
+      if (!e || e.percent === undefined || e.percent === null) return { ok: false, error: '分かった割合が入っていません。' };
+      var id = 'll_demo' + Date.now().toString(36);
+      dbListening.push({
+        id: id, date: e.date || demoDate(0), kind: e.kind === 'live' ? 'live' : 'archive', subtitles: e.subtitles === 'en' ? 'en' : 'none',
+        minutes: Number(e.minutes) || 5, speed: Number(e.speed) || 1, percent: Math.max(0, Math.min(100, Math.round(Number(e.percent)))),
+        mainCause: ({ vocab: 1, sound: 1, speed: 1 })[e.mainCause] ? e.mainCause : '', memo: String(e.memo || '').slice(0, 200),
+        createdAt: new Date().toISOString()
+      });
+      return { ok: true, data: { id: id, logs: listeningSorted() } };
+    },
+    apiDeleteListeningLog: function (id) {
+      dbListening = dbListening.filter(function (l) { return l.id !== id; });
+      return { ok: true, data: { logs: listeningSorted() } };
+    },
     apiGetBootstrapData: function () {
       return {
         ok: true,
@@ -377,6 +411,7 @@
           passages: dbPassages.slice(),
           streams: dbStreams.slice(),
           stats: computeStats(),
+          listeningLogs: listeningSorted(),
           settings: Object.assign({}, dbSettings),
           apiKeyStatus: { configured: true, masked: 'AQ.A••••••••Demo' },
           triggerStatus: { enabled: triggerEnabled },

@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
-<link rel="stylesheet" href="styles.css?v=2026-11-24_0100">
+<link rel="stylesheet" href="styles.css?v=2026-11-24_0115">
 <script>
   // 表示テーマ（自動・明るい・暗い）を描画の前に決める
   try { var t = localStorage.getItem('saba_theme'); if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); } catch (e) {}
@@ -227,6 +227,22 @@
         <div class="badge-row" id="levelBreakdownBadges"></div>
       </div>
 
+      <div class="group-heading">聞き取り</div>
+      <div class="card" id="listenCard">
+        <h2 class="section-title"><span><i data-ic="headphones"></i>聞き取りの理解度</span><span class="badge num" id="listenCountBadge">0 回</span></h2>
+        <div id="listenSummary"></div>
+        <figure class="listen-chart" id="listenChartWrap" hidden>
+          <div class="listen-legend" id="listenLegend"></div>
+          <div class="listen-chart-box" id="listenChart"></div>
+          <div class="listen-tip" id="listenTip" hidden></div>
+        </figure>
+        <button class="btn-primary" id="openListenLogBtn" type="button"><i data-ic="plus"></i>記録する</button>
+        <details class="listen-history" id="listenHistory" hidden>
+          <summary>これまでの記録</summary>
+          <div id="listenList"></div>
+        </details>
+      </div>
+
       <div class="group-heading">音声</div>
       <div class="card">
         <h2 class="section-title"><span><i data-ic="download"></i>端末に保存した音声</span><span class="badge num" id="settingsAudioCacheBadge">0 / 0</span></h2>
@@ -422,6 +438,53 @@
   </div>
 </div>
 
+<!-- ========== 聞き取りの理解度を記録 ========== -->
+<div class="modal-backdrop" id="listenLogModal" role="dialog" aria-modal="true" aria-labelledby="listenLogModalTitle">
+  <div class="modal-sheet">
+    <div class="modal-header">
+      <h3 class="modal-title is-ja" id="listenLogModalTitle">聞き取りを記録</h3>
+      <button class="player-close-btn" id="listenLogClose" type="button" aria-label="閉じる"><i data-ic="close"></i></button>
+    </div>
+    <p class="helper-note" style="margin:0 0 12px;">止めずに聞き終わったら、分かった割合をざっくり選びます。</p>
+    <div class="field-group">
+      <label class="field-label" for="llPercent">分かった割合</label>
+      <div class="pct-readout"><span class="num" id="llPercentOut">50</span><small>%</small></div>
+      <input class="pct-range" id="llPercent" type="range" min="0" max="100" step="5" value="50">
+      <div class="pct-scale" aria-hidden="true"><span>0</span><span>50</span><span>100</span></div>
+    </div>
+    <div class="row-2col">
+      <div class="field-group"><span class="field-label">聞いたもの</span>
+        <div class="seg-2" role="group" aria-label="聞いたもの" data-ll="kind">
+          <button class="seg-btn" type="button" data-v="archive">アーカイブ</button><button class="seg-btn" type="button" data-v="live">ライブ</button>
+        </div>
+      </div>
+      <div class="field-group"><span class="field-label">字幕</span>
+        <div class="seg-2" role="group" aria-label="字幕" data-ll="subtitles">
+          <button class="seg-btn" type="button" data-v="none">なし</button><button class="seg-btn" type="button" data-v="en">英語</button>
+        </div>
+      </div>
+    </div>
+    <div class="row-2col">
+      <div class="field-group"><label class="field-label" for="llMinutes">長さ（分）</label><input class="text-input" id="llMinutes" type="number" inputmode="decimal" min="1" max="600" step="1" value="5"></div>
+      <div class="field-group"><label class="field-label" for="llSpeed">速さ</label>
+        <select class="select-field" id="llSpeed" style="margin:0;">
+          <option value="0.75">0.75x</option><option value="0.85">0.85x</option><option value="0.9">0.9x</option>
+          <option value="1" selected>1x（等速）</option><option value="1.1">1.1x</option><option value="1.25">1.25x</option>
+        </select>
+      </div>
+    </div>
+    <div class="field-group"><span class="field-label">聞き取れなかった、いちばんの原因</span>
+      <div class="seg-2" role="group" aria-label="いちばんの原因" data-ll="mainCause">
+        <button class="seg-btn" type="button" data-v="vocab">知らない語</button><button class="seg-btn" type="button" data-v="sound">音で分からない</button>
+        <button class="seg-btn" type="button" data-v="speed">速くて追えない</button><button class="seg-btn" type="button" data-v="">とくになし</button>
+      </div>
+    </div>
+    <div class="field-group"><label class="field-label" for="llMemo">何を聞いたか（メモ）</label><input class="text-input" id="llMemo" type="text" maxlength="200" placeholder="例：11/20 の Minecraft 配信 1:02:00〜"></div>
+    <div class="field-group"><label class="field-label" for="llDate">日付</label><input class="text-input" id="llDate" type="date"></div>
+    <button class="btn-primary" id="submitListenLogBtn" type="button">記録する</button>
+  </div>
+</div>
+
 <!-- ========== 表現の詳しい説明・編集 ========== -->
 <div class="modal-backdrop" id="detailModal" role="dialog" aria-modal="true" aria-labelledby="detailModalTitle">
   <div class="modal-sheet">
@@ -470,8 +533,8 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-  if (/[?&]demo=1(&|$)/.test(location.search)) document.write('<script src="demo.js?v=2026-11-24_0100"><\/script>');
+  if (/[?&]demo=1(&|$)/.test(location.search)) document.write('<script src="demo.js?v=2026-11-24_0115"><\/script>');
 </script>
-<script src="app.js?v=2026-11-24_0100"></script>
+<script src="app.js?v=2026-11-24_0115"></script>
 </body>
 </html>
