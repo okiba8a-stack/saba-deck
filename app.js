@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  var VERSION = "2026-11-23 21:30";
+  var VERSION = "2026-11-24 01:00";
 
   /* ============================================================
    * 接続の設定（?c= か、この端末に保存したもの）
@@ -178,6 +178,8 @@
     playerStatus: 'idle',       // 'idle' | 'loading' | 'playing' | 'paused'
     loopMode: false,
     playbackRate: 1.0,
+    cardAutoAudio: true,        // 単語練習で、次のカードを出したら音声を自動で流す（端末ごとに保存）
+    cardAutoAudioArm: false,    // タップで次のカードに進んだときだけ true（裏での描き直しでは鳴らさない）
 
     // 聴き流し（シャドーイング連続自動再生）
     autoplayActive: false,
@@ -1826,6 +1828,7 @@
     state.studyView = 'session';
     renderStudyViewVisibility();
     updateStudyUndoButton();
+    state.cardAutoAudioArm = true;
     renderStudyCard();
   }
 
@@ -1846,7 +1849,18 @@
     if (undoBtn) undoBtn.disabled = state.studyHistory.length === 0;
   }
 
+  // 次のカードを出したとき、音声を自動で流す。
+  // タップの処理の中から同じ流れで呼ぶので、iPhone でも鳴らせる（裏での描き直しでは鳴らさない）
+  function maybeAutoPlayStudyCard(card, sameCard, armed) {
+    if (!armed || sameCard || !state.cardAutoAudio || !card || !card.audioFile) return;
+    if (state.activeClipType === 'vocab' && state.activeCardId === card.id && state.playerStatus === 'playing') return;
+    stopAutoplayMode();
+    playClipObject(card, 'vocab', false, true);
+  }
+
   function renderStudyCard() {
+    var autoArmed = state.cardAutoAudioArm;
+    state.cardAutoAudioArm = false;
     renderStudyViewVisibility();
     if (state.studyView !== 'session') {
       renderStudyGroups();
@@ -1926,6 +1940,7 @@
         '</button>' +
         '<button class="study-audio-mini' + (state.loopMode ? ' active' : '') + '" type="button" id="studyLoopBtn" aria-pressed="' + String(state.loopMode) + '" title="くり返し" aria-label="くり返し">' + ic('repeat') + '</button>' +
         '<button class="study-audio-mini" type="button" id="studySpeedBtn" title="速さ" aria-label="再生の速さ">' + escapeHtml(state.playbackRate + 'x') + '</button>' +
+        '<button class="study-audio-mini is-ja' + (state.cardAutoAudio ? ' active' : '') + '" type="button" id="studyAutoAudioBtn" aria-pressed="' + String(state.cardAutoAudio) + '" title="次のカードで音声を自動で流す" aria-label="次のカードで音声を自動で流す">自動</button>' +
       '</div>';
 
     var cardHeadHtml =
@@ -1955,6 +1970,13 @@
         safeStorageSet('saba_speed', state.playbackRate);
         if (state.audioEl) state.audioEl.playbackRate = state.playbackRate;
         updatePlayerButtonsUi();
+      });
+      document.getElementById('studyAutoAudioBtn').addEventListener('click', function () {
+        state.cardAutoAudio = !state.cardAutoAudio;
+        safeStorageSet('saba_card_autoplay', state.cardAutoAudio ? '1' : '0');
+        this.classList.toggle('active', state.cardAutoAudio);
+        this.setAttribute('aria-pressed', String(state.cardAutoAudio));
+        showToast(state.cardAutoAudio ? '次のカードで自動再生：オン' : '次のカードで自動再生：オフ');
       });
       document.getElementById('studyFavBtn').addEventListener('click', function () { toggleCardFavorite(card); });
       updatePlayerButtonsUi();
@@ -2008,6 +2030,7 @@
         '</article>';
 
       wireInlineStudyAudio();
+      maybeAutoPlayStudyCard(card, sameCard, autoArmed);
 
       var qBtns = container.querySelectorAll('[data-quiz-idx]');
       for (var q = 0; q < qBtns.length; q++) {
@@ -2027,6 +2050,7 @@
           state.studyIndex++;
           state.quizAnsweredIdx = -1;
           state.quizOptions = [];
+          state.cardAutoAudioArm = true;
           renderStudyCard();
         });
       }
@@ -2080,6 +2104,7 @@
       '</article>';
 
     wireInlineStudyAudio();
+    maybeAutoPlayStudyCard(card, sameCard, autoArmed);
 
     var revealBtn = document.getElementById('revealAnswerBtn');
     if (revealBtn) revealBtn.addEventListener('click', function () { state.cardRevealed = true; renderStudyCard(); });
@@ -2166,6 +2191,7 @@
     state.studyIndex++;
     state.cardRevealed = false;
     updateStudyUndoButton();
+    state.cardAutoAudioArm = true;
     renderStudyCard();
   }
 
@@ -3045,6 +3071,7 @@
         el.classList.toggle('active', active);
         el.setAttribute('aria-selected', String(active));
       });
+      state.cardAutoAudioArm = true;
       renderStudyCard();
     }
     document.getElementById('modeNormalBtn').addEventListener('click', function () { setStudyMode('normal'); });
@@ -3090,6 +3117,7 @@
       state.studyIndex = prev.prevIndex;
       state.cardRevealed = false;
       updateStudyUndoButton();
+      state.cardAutoAudioArm = true;
       renderStudyCard();
       showToast(canceled ? '答えを取り消しました' : '前のカードに戻りました');
     });
@@ -3516,6 +3544,7 @@
     hideSetup();
     var savedSpeed = parseFloat(safeStorageGet('saba_speed', '1.0'));
     if (SPEED_STEPS.indexOf(savedSpeed) !== -1) state.playbackRate = savedSpeed;
+    state.cardAutoAudio = safeStorageGet('saba_card_autoplay', '1') !== '0';
     initAudioElement();
     updatePlayerButtonsUi();
     bindEvents();
