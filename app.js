@@ -4,7 +4,7 @@
 (function () {
   'use strict';
 
-  var VERSION = "2026-11-24 01:15";
+  var VERSION = "2026-11-25 15:27";
 
   /* ============================================================
    * 接続の設定（?c= か、この端末に保存したもの）
@@ -123,7 +123,7 @@
     studyGroupTab: 'units',     // 'units' | 'smart'
     activeStudyGroupId: '',
     activeStudyGroupTitle: '',
-    studyMode: 'normal',        // 'normal' | 'quiz' | 'listening'
+    studyMode: 'quiz',          // 'quiz'（意味を選ぶ） | 'listening'（穴埋め）
     studyFilter: 'due',
     studyCreator: 'all',
     studyStreamVideoId: 'all',
@@ -183,6 +183,12 @@
     llForm: { kind: 'archive', subtitles: 'none', mainCause: '' },
     cardAutoAudio: true,        // 単語練習で、次のカードを出したら音声を自動で流す（端末ごとに保存）
     cardAutoAudioArm: false,    // タップで次のカードに進んだときだけ true（裏での描き直しでは鳴らさない）
+    lesson: null,               // 勉強をはじめる：いまのレッスン（null なら無し）
+    lessonSummary: null,        // これまでのレッスンのまとめ（シート LessonLog）
+    lessonWriteAt: 0,           // 最後にレッスンの結果を当てた時刻（それより古い読み込みの返事で上書きしない）
+    lessonAutoArm: false,
+    lessonCloseArmed: false,
+    lessonCloseTimer: null,
 
     // 聴き流し（シャドーイング連続自動再生）
     autoplayActive: false,
@@ -193,6 +199,9 @@
 
     isExtracting: false
   };
+
+  // 試し表示（?demo=1）のときだけ、確かめ用に状態をのぞけるようにする
+  if (DEMO) window.__sabaDemoState = function () { return state; };
 
   var SPEED_STEPS = [0.75, 0.85, 1.0, 1.1, 1.25];
   var ALLOWED_LEVELS = { Basic: true, Natural: true, Slang: true };
@@ -441,16 +450,6 @@
 
   function isWeakCard(card) {
     return (Number(card.lapses) || 0) >= 2 || (Number(card.ease) || 2.5) <= 2.0;
-  }
-
-  function previewNextIntervalLabel(card, rating) {
-    var ease = Number(card.ease) || 2.5;
-    var interval = Number(card.intervalDays) || 0;
-    var reps = Number(card.reps) || 0;
-    if (rating === 'again') return '10分';
-    if (rating === 'hard') return (interval <= 0 ? 1 : Math.max(1, Math.round(interval * 1.2))) + '日';
-    if (rating === 'easy') return (reps === 0 ? 4 : (reps === 1 ? 7 : Math.max(7, Math.round(interval * Math.min(3.2, ease + 0.15) * 1.3)))) + '日';
-    return (reps === 0 ? 1 : (reps === 1 ? 4 : Math.max(4, Math.round(interval * ease)))) + '日';
   }
 
   function getCreatorList() {
@@ -1367,6 +1366,16 @@
     var studySpeedBtn = document.getElementById('studySpeedBtn');
     if (studySpeedBtn) studySpeedBtn.textContent = state.playbackRate + 'x';
 
+    // レッスンの中のボタン
+    var lessonPlayBtn = document.getElementById('lessonPlayBtn');
+    if (lessonPlayBtn && state.studyView === 'lesson') {
+      var curLessonId = lessonCurrentCardId();
+      var isLessonActive = state.activeClipType === 'vocab' && curLessonId && state.activeCardId === curLessonId;
+      paintPlayButton(lessonPlayBtn, isLessonActive, lessonPlayBtn.getAttribute('data-idle-label') || '聴く', '');
+    }
+    var lessonSpeedBtn = document.getElementById('lessonSpeedBtn');
+    if (lessonSpeedBtn) lessonSpeedBtn.textContent = state.playbackRate + 'x';
+
     // 長文の中のボタン
     var passagePlayBtn = document.getElementById('playPassageHeroBtn');
     if (passagePlayBtn) {
@@ -1511,9 +1520,11 @@
     document.getElementById('todayGoalBadge').classList.toggle('is-done', goalRatio >= 1);
     document.getElementById('todayGoalBadge').setAttribute('aria-label', '今日 ' + st.todayReviewed + ' / ' + goal + ' 枚');
 
+    // 復習の数は「学んだ単語で、時期が来たもの」だけ（裏方の dueCount は新しい単語も数えている）
+    var reviewDueCount = state.vocab.filter(isReviewDue).length;
     var dueBadge = document.getElementById('navDueBadge');
-    if (st.counts.dueCount > 0) {
-      dueBadge.textContent = st.counts.dueCount > 99 ? '99+' : String(st.counts.dueCount);
+    if (reviewDueCount > 0) {
+      dueBadge.textContent = reviewDueCount > 99 ? '99+' : String(reviewDueCount);
       dueBadge.classList.remove('hidden');
     } else {
       dueBadge.classList.add('hidden');
@@ -1553,7 +1564,7 @@
     document.getElementById('statsRingBar').setAttribute('stroke-dashoffset', String(263.9 * (1 - goalRatio)));
     document.getElementById('goalBarFill').style.width = Math.round(goalRatio * 100) + '%';
     document.getElementById('statStreak').textContent = st.streakDays + '日';
-    document.getElementById('statDue').textContent = String(st.counts.dueCount);
+    document.getElementById('statDue').textContent = String(reviewDueCount);
     document.getElementById('statTotal').textContent = String(st.counts.total);
     document.getElementById('statMastered').textContent = String(st.counts.masteredCount);
 
@@ -1897,28 +1908,819 @@
   }
 
   /* ============================================================
-   * 単語：カード・4択・穴埋め
+   * 勉強をはじめる（レッスン）
+   * Duolingo のように、頻出順のユニット（20語）を「レッスン4つ（5語ずつ）＋まとめテスト」に分けた道を進む。
+   * レッスンは20問（5語×4問）。①意味を選ぶ ②聞いて選ぶ ③英語で言うと ④穴埋め、の順にだんだん難しくする。
+   * まちがえた問題は最後にもう一度出る（正解したぶんだけ進みのバーが伸びる）。
+   * 結果は終わったときに一度だけ送る（apiFinishLesson）。送れなければ端末に残して、次に読み込むときに送る。
    * ============================================================ */
-  function buildQuizOptionsForCard(card) {
-    var pool = state.vocab.filter(function (v) {
-      return v.id !== card.id && v.meaningJa && v.meaningJa !== card.meaningJa;
-    });
-    // シャッフルして3件のダミー意味を取得
-    for (var i = pool.length - 1; i > 0; i--) {
+  var LESSON_SLOT_SIZE = 5;
+  var LESSON_QUESTION_TARGET = 20;
+  var LESSON_PENDING_KEY = 'saba_pending_lessons';
+  var LQ_LABEL = {
+    meaning: '意味を選ぼう',
+    listen: '聞こえた表現を選ぼう',
+    recall: '英語で言うと？',
+    cloze: '空いているところに入るのは？'
+  };
+  var LQ_ICON = { meaning: 'translate', listen: 'headphones', recall: 'speech', cloze: 'waves' };
+
+  // 一度でも答えた（学んだ）単語か。新しい単語は lastReviewedAt が空
+  function isStudiedCard(c) {
+    return Boolean(c && (c.lastReviewedAt || (Number(c.reps) || 0) > 0 || c.status === 'learning' || c.status === 'mastered'));
+  }
+  // 復習の時期が来た「学んだ単語」（新しい単語は復習に入れない）
+  function isReviewDue(c) { return isStudiedCard(c) && isDueClient(c); }
+
+  function shuffleArr(arr) {
+    for (var i = arr.length - 1; i > 0; i--) {
       var j = Math.floor(Math.random() * (i + 1));
-      var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+      var t = arr[i]; arr[i] = arr[j]; arr[j] = t;
     }
-    var distractors = pool.slice(0, 3).map(function (d) {
-      return { meaningJa: d.meaningJa, isCorrect: false };
-    });
-    var opts = distractors.concat([{ meaningJa: card.meaningJa, isCorrect: true }]);
-    for (var k = opts.length - 1; k > 0; k--) {
-      var r = Math.floor(Math.random() * (k + 1));
-      var t = opts[k]; opts[k] = opts[r]; opts[r] = t;
-    }
-    return opts;
+    return arr;
   }
 
+  function lessonCreatorKey() { return state.studyCreator || 'all'; }
+  function lessonTestKey(unitNum) { return lessonCreatorKey() + '|' + unitNum; }
+  function isUnitTestPassed(unitNum) {
+    var s = state.lessonSummary;
+    return Boolean(s && Array.isArray(s.testsPassed) && s.testsPassed.indexOf(lessonTestKey(unitNum)) !== -1);
+  }
+
+  // 道を作る。next は「勉強をはじめる」で出すもの：
+  //   まだ学んでいない語がある最初のユニット（F）の、最初のレッスン。
+  //   ただし1つ前のユニットのまとめテストが済んでいなければ、先にそのテスト。
+  function buildLessonPath() {
+    var sorted = getCreatorVocabSortedByFreq();
+    var units = [];
+    for (var i = 0; i < sorted.length; i += UNIT_SIZE) {
+      var cards = sorted.slice(i, i + UNIT_SIZE);
+      var slots = [];
+      for (var s = 0; s < cards.length; s += LESSON_SLOT_SIZE) {
+        var sc = cards.slice(s, s + LESSON_SLOT_SIZE);
+        slots.push({ idx: slots.length, cards: sc, newCount: sc.filter(function (c) { return !isStudiedCard(c) && isAskable(c); }).length });
+      }
+      var unitNew = 0;
+      slots.forEach(function (sl) { unitNew += sl.newCount; });
+      units.push({ num: units.length + 1, cards: cards, slots: slots, newCount: unitNew, askable: cards.filter(isAskable).length });
+    }
+    var frontier = -1;
+    for (var u = 0; u < units.length; u++) { if (units[u].newCount > 0) { frontier = u; break; } }
+    var prevIdx = frontier === -1 ? units.length - 1 : frontier - 1;
+    var next;
+    // 出せる語が1つもないユニットは、テストを済んだことにする（道が止まらないように）
+    if (prevIdx >= 0 && units[prevIdx].askable > 0 && !isUnitTestPassed(units[prevIdx].num)) {
+      next = { kind: 'test', unitIdx: prevIdx, slotIdx: -1 };
+    } else if (frontier !== -1) {
+      var slotIdx = 0;
+      for (var k = 0; k < units[frontier].slots.length; k++) { if (units[frontier].slots[k].newCount > 0) { slotIdx = k; break; } }
+      next = { kind: 'lesson', unitIdx: frontier, slotIdx: slotIdx };
+    } else {
+      next = { kind: 'done', unitIdx: units.length - 1, slotIdx: -1 };
+    }
+    return {
+      units: units,
+      next: next,
+      studied: sorted.filter(isStudiedCard).length,
+      total: sorted.length
+    };
+  }
+
+  function lessonStepTitle(path, step) {
+    var unit = path.units[step.unitIdx];
+    if (!unit) return '';
+    if (step.kind === 'test') return 'Unit ' + unit.num + ' · まとめテスト';
+    if (step.kind === 'lesson') return 'Unit ' + unit.num + ' · レッスン ' + (step.slotIdx + 1);
+    return 'Unit ' + unit.num;
+  }
+
+  function canCloze(c) { return Boolean(c && c.quoteEn && buildClozeQuoteHtml(c.quoteEn, c.expression)); }
+  // 何かの形で問題にできる語か（意味も音声も穴埋めできるセリフもない語は、レッスンに出せない）
+  function isAskable(c) { return Boolean(c && pickQuestionType(c, 'meaning')); }
+
+  // その語で出せる形。出せなければ近い形に置きかえる（音声がない・セリフに表現が入っていない など）
+  function pickQuestionType(c, want) {
+    var order = {
+      meaning: ['meaning', 'recall', 'listen'],
+      listen: ['listen', 'recall', 'meaning'],
+      recall: ['recall', 'meaning', 'listen'],
+      cloze: ['cloze', 'listen', 'recall', 'meaning']
+    }[want] || ['meaning'];
+    for (var i = 0; i < order.length; i++) {
+      var t = order[i];
+      if ((t === 'meaning' || t === 'recall') && c.meaningJa && c.expression) return t;
+      if (t === 'listen' && c.audioFile && c.expression) return t;
+      if (t === 'cloze' && canCloze(c)) return t;
+    }
+    return '';
+  }
+
+  // レッスン：5語 × ①意味 ②聞き取り ③英語で ④穴埋め。1巡目は順番どおり、2巡目からは混ぜる
+  function buildLessonQuestions(words) {
+    var rounds = ['meaning', 'listen', 'recall', 'cloze'];
+    var qs = [];
+    rounds.forEach(function (want, r) {
+      var round = words.map(function (c) { return { wordId: c.id, type: pickQuestionType(c, want), round: r }; })
+        .filter(function (q) { return q.type; });
+      if (r > 0) {
+        shuffleArr(round);
+        // 同じ語が続かないように
+        if (round.length > 1 && qs.length && round[0].wordId === qs[qs.length - 1].wordId) {
+          var t = round[0]; round[0] = round[1]; round[1] = t;
+        }
+      }
+      qs = qs.concat(round);
+    });
+    return qs;
+  }
+
+  // 語が少ないレッスン（最後のユニットなど）は、学んだ語の復習で20問にそろえる
+  function fillLessonWithReview(qs, excludeIds) {
+    if (qs.length >= LESSON_QUESTION_TARGET) return qs;
+    var pool = getCreatorVocabSortedByFreq().filter(function (c) { return isStudiedCard(c) && !excludeIds[c.id]; });
+    var pick = shuffleArr(pool.filter(isDueClient)).concat(shuffleArr(pool.filter(function (c) { return !isDueClient(c); })));
+    var wants = ['listen', 'recall', 'cloze'];
+    for (var i = 0; i < pick.length && qs.length < LESSON_QUESTION_TARGET; i++) {
+      var t = pickQuestionType(pick[i], wants[i % wants.length]);
+      if (t) qs.push({ wordId: pick[i].id, type: t, round: 4 });
+    }
+    return qs;
+  }
+
+  // まとめテスト：ユニットの語を1問ずつ、難しい形（穴埋め・聞き取り・英語で）で
+  function buildTestQuestions(cards) {
+    var wants = ['cloze', 'listen', 'recall'];
+    var qs = cards.map(function (c, i) { return { wordId: c.id, type: pickQuestionType(c, wants[i % wants.length]), round: 0 }; })
+      .filter(function (q) { return q.type; });
+    return shuffleArr(qs);
+  }
+
+  // 意味が重なっているか（「ちょっと待って」と「ちょっと待って、そのまま待って」など）。
+  // 重なる語をまちがいの選択肢にすると、正解が2つあるように見えるので避ける
+  function meaningParts(m) {
+    return String(m || '').split(/[、,，／\/・;；()（）「」\s]+/)
+      .map(function (x) { return x.replace(/[！!？?。〜~…]/g, '').trim(); })
+      .filter(function (x) { return x.length >= 2; });
+  }
+  function meaningsOverlap(a, b) {
+    var pa = meaningParts(a);
+    var pb = meaningParts(b);
+    for (var i = 0; i < pa.length; i++) {
+      for (var j = 0; j < pb.length; j++) {
+        if (pa[i].indexOf(pb[j]) !== -1 || pb[j].indexOf(pa[i]) !== -1) return true;
+      }
+    }
+    return false;
+  }
+
+  // 4択の選択肢。意味を選ぶときは日本語、ほかは英語の表現。
+  // まちがいの選択肢は、同じレッスンの語を2つまで → 同じ種類の語 → ほかの語、の順に選ぶ
+  function buildChoiceOptions(card, type, siblingIds) {
+    var field = type === 'meaning' ? 'meaningJa' : 'expression';
+    var norm = function (s) { return String(s || '').trim().toLowerCase(); };
+    var used = {};
+    used[norm(card[field])] = true;
+    var picks = [];
+    var correctExpr = norm(card.expression);
+    function makeTry(strict) {
+      return function (c) {
+        if (picks.length >= 3 || !c || c.id === card.id) return;
+        var v = c[field];
+        var k = norm(v);
+        if (!k || used[k]) return;
+        // 穴埋めで、セリフの空所にほかの選択肢も当てはまってしまうものは使わない
+        if (type === 'cloze') {
+          var re = buildExpressionRegex(c.expression);
+          if (re && re.test(String(card.quoteEn || ''))) return;
+        }
+        if (strict) {
+          if (meaningsOverlap(c.meaningJa, card.meaningJa)) return;
+          var e = norm(c.expression);
+          if (e && correctExpr && (e.indexOf(correctExpr) !== -1 || correctExpr.indexOf(e) !== -1)) return;
+        }
+        used[k] = true;
+        picks.push(v);
+      };
+    }
+    var tryStrict = makeTry(true);
+    var siblings = shuffleArr((siblingIds || []).map(findCardById).filter(function (c) { return c && c.id !== card.id; }));
+    siblings.slice(0, 2).forEach(tryStrict);
+    if (picks.length < 3) shuffleArr(state.vocab.filter(function (v) { return v.category === card.category; })).forEach(tryStrict);
+    if (picks.length < 3) shuffleArr(state.vocab.slice()).forEach(tryStrict);
+    if (picks.length < 3) shuffleArr(state.vocab.slice()).forEach(makeTry(false));   // 語が少ないときだけ
+    var opts = picks.map(function (v) { return { text: v, isCorrect: false }; });
+    opts.push({ text: card[field], isCorrect: true });
+    return shuffleArr(opts);
+  }
+
+  // 画面の SM-2 と同じ計算（記録を送る前に手元へ当てて、次のレッスンをすぐ決められるように）
+  function calcNextSrsClient(card, rating) {
+    var now = Date.now();
+    var ease = Number(card.ease); if (isNaN(ease) || ease < 1.3) ease = 2.5;
+    var interval = Number(card.intervalDays); if (isNaN(interval) || interval < 0) interval = 0;
+    var reps = Number(card.reps); if (isNaN(reps) || reps < 0) reps = 0;
+    var lapses = Number(card.lapses); if (isNaN(lapses) || lapses < 0) lapses = 0;
+    var out = { ease: ease, intervalDays: interval, reps: reps, lapses: lapses, status: 'learning' };
+    var nextMs = now;
+    if (rating === 'again') {
+      out.reps = 0; out.intervalDays = 0; out.lapses = lapses + 1;
+      out.ease = Math.max(1.3, Math.round((ease - 0.2) * 100) / 100);
+      nextMs = now + 10 * 60 * 1000;
+    } else if (rating === 'hard') {
+      out.reps = Math.max(1, reps);
+      out.ease = Math.max(1.3, Math.round((ease - 0.15) * 100) / 100);
+      out.intervalDays = interval <= 0 ? 1 : Math.max(1, Math.round(interval * 1.2));
+      out.status = out.intervalDays >= 21 ? 'mastered' : 'learning';
+      nextMs = now + out.intervalDays * 86400000;
+    } else if (rating === 'easy') {
+      out.reps = reps + 1;
+      out.ease = Math.min(3.2, Math.round((ease + 0.15) * 100) / 100);
+      out.intervalDays = reps === 0 ? 4 : (reps === 1 ? 7 : Math.max(7, Math.round(interval * out.ease * 1.3)));
+      out.status = out.intervalDays >= 14 ? 'mastered' : 'learning';
+      nextMs = now + out.intervalDays * 86400000;
+    } else {
+      out.reps = reps + 1;
+      out.intervalDays = reps === 0 ? 1 : (reps === 1 ? 4 : Math.max(4, Math.round(interval * ease)));
+      out.status = out.intervalDays >= 21 ? 'mastered' : 'learning';
+      nextMs = now + out.intervalDays * 86400000;
+    }
+    out.nextReviewAt = new Date(nextMs).toISOString();
+    out.lastReviewedAt = new Date(now).toISOString();
+    return out;
+  }
+
+  function lessonCurrentQuestion() {
+    var L = state.lesson;
+    return L && !L.finished ? L.queue[L.pos] : null;
+  }
+  function lessonCurrentCardId() {
+    var q = lessonCurrentQuestion();
+    return q ? q.wordId : '';
+  }
+  function lessonWordIds(L) {
+    var seen = {};
+    var ids = [];
+    L.queue.forEach(function (q) { if (!seen[q.wordId]) { seen[q.wordId] = true; ids.push(q.wordId); } });
+    return ids;
+  }
+
+  function startLesson(step) {
+    var path = buildLessonPath();
+    var unit = path.units[step.unitIdx];
+    if (!unit) return;
+    var words;
+    var qs;
+    if (step.kind === 'test') {
+      words = unit.cards;
+      qs = buildTestQuestions(words);
+    } else {
+      var slot = unit.slots[step.slotIdx];
+      if (!slot) return;
+      words = slot.cards;
+      qs = buildLessonQuestions(words);
+      var exclude = {};
+      words.forEach(function (c) { exclude[c.id] = true; });
+      qs = fillLessonWithReview(qs, exclude);
+    }
+    if (!qs.length) { showToast('このレッスンで出せる問題がありません', true); return; }
+    var newIds = {};
+    qs.forEach(function (q) { if (!isStudiedCard(findCardById(q.wordId))) newIds[q.wordId] = true; });
+
+    flushPendingReview();
+    stopAutoplayMode();
+    pausePlayerQuietly();
+    state.lesson = {
+      kind: step.kind === 'test' ? 'test' : 'lesson',
+      unitNum: unit.num,
+      slotIdx: step.kind === 'test' ? 0 : step.slotIdx,
+      title: lessonStepTitle(path, step),
+      queue: qs,
+      pos: 0,
+      total: qs.length,
+      progress: 0,        // 正解した数（進みのバー）
+      firstTry: 0,        // 1回目で正解した数
+      mistakes: 0,
+      wrongByWord: {},
+      newIds: newIds,
+      seenIds: {},
+      answered: -1,
+      options: [],
+      combo: 0,
+      bestCombo: 0,
+      startedAt: Date.now(),
+      finished: false,
+      result: null
+    };
+    state.lessonCloseArmed = false;
+    state.studyView = 'lesson';
+    state.lessonAutoArm = true;
+    renderLesson();
+    window.scrollTo({ top: 0 });
+  }
+
+  function exitLesson() {
+    pausePlayerQuietly();
+    state.lesson = null;
+    state.lessonCloseArmed = false;
+    state.studyView = 'groups';
+    renderStudyViewVisibility();
+    renderStudyGroups();
+    window.scrollTo({ top: 0 });
+  }
+
+  function renderLessonTopBar() {
+    var L = state.lesson;
+    var fill = document.getElementById('lessonProgressFill');
+    var txt = document.getElementById('lessonProgressText');
+    var combo = document.getElementById('lessonComboBadge');
+    var closeBtn = document.getElementById('lessonCloseBtn');
+    if (!L || !fill) return;
+    var pct = L.finished ? 100 : Math.min(100, Math.round((L.progress / Math.max(1, L.total)) * 100));
+    fill.style.width = pct + '%';
+    txt.textContent = Math.min(L.progress, L.total) + ' / ' + L.total;
+    combo.style.display = !L.finished && L.combo >= 3 ? 'inline-flex' : 'none';
+    combo.innerHTML = ic('flame') + '<span>' + L.combo + '</span>';
+    closeBtn.classList.toggle('armed', Boolean(state.lessonCloseArmed));
+    closeBtn.innerHTML = state.lessonCloseArmed ? '<span class="lesson-close-text">やめる</span>' : ic('close');
+    closeBtn.setAttribute('aria-label', state.lessonCloseArmed ? 'もう一度押すとやめます' : 'レッスンをやめる');
+  }
+
+  function lessonAudioRowHtml(card, bigListen) {
+    var hasAudio = Boolean(card.audioFile);
+    var label = bigListen ? 'もう一度聞く' : '聴く';
+    return '<div class="study-audio-row' + (bigListen ? ' is-big' : '') + '">' +
+      '<button class="play-hero-btn" type="button" id="lessonPlayBtn" data-idle-label="' + escapeHtml(hasAudio ? label : '音声なし') + '"' + (hasAudio ? '' : ' disabled') + '>' +
+        ic('play') + '<span>' + escapeHtml(hasAudio ? label : '音声なし') + '</span>' +
+      '</button>' +
+      '<button class="study-audio-mini" type="button" id="lessonSpeedBtn" title="速さ" aria-label="再生の速さ">' + escapeHtml(state.playbackRate + 'x') + '</button>' +
+    '</div>';
+  }
+
+  // 問題ごとの上半分（何を見せて、何を聞くか）
+  function lessonPromptHtml(card, type, answered) {
+    if (type === 'meaning') {
+      return '<div class="card-expression">' + escapeHtml(card.expression) + '</div>' + lessonAudioRowHtml(card, false);
+    }
+    if (type === 'listen') {
+      return (answered ? '<div class="card-expression is-small">' + escapeHtml(card.expression) + '</div>' : '') +
+        lessonAudioRowHtml(card, true);
+    }
+    if (type === 'recall') {
+      return '<p class="lesson-ja-prompt">' + escapeHtml(card.meaningJa) + '</p>' +
+        (answered ? lessonAudioRowHtml(card, false) : '<div class="lesson-ja-note">この意味になる英語は？</div>');
+    }
+    // 穴埋め
+    var cloze = answered
+      ? '“' + highlightExpressionInQuote(card.quoteEn, card.expression) + '”'
+      : buildClozeQuoteHtml(card.quoteEn, card.expression);
+    return '<div class="listening-mask">' +
+        '<div class="listening-label">' + ic('headphones') + '配信のセリフ</div>' +
+        '<div class="cloze-prompt">' + cloze + '</div>' +
+        (card.quoteJa ? '<div class="lesson-cloze-ja">' + escapeHtml(card.quoteJa) + '</div>' : '') +
+      '</div>' + lessonAudioRowHtml(card, false);
+  }
+
+  function lessonOptionsHtml(opts, answeredIdx, isEn) {
+    var keys = ['A', 'B', 'C', 'D'];
+    var answered = answeredIdx !== -1;
+    return '<div class="quiz-options' + (isEn ? ' is-en' : '') + '">' + opts.map(function (opt, idx) {
+      var cls = 'quiz-opt-btn';
+      if (answered) {
+        if (opt.isCorrect) cls += ' correct';
+        else if (idx === answeredIdx) cls += ' wrong';
+        else cls += ' dimmed';
+      }
+      return '<button class="' + cls + '" type="button" data-choice-idx="' + idx + '"' + (answered ? ' disabled' : '') + '>' +
+        '<span class="quiz-opt-key">' + keys[idx] + '</span>' +
+        '<span class="quiz-opt-text">' + escapeHtml(opt.text) + '</span>' +
+      '</button>';
+    }).join('') + '</div>';
+  }
+
+  // 答えたあとの帯（正解・不正解と、表現の意味・セリフ）
+  function lessonFeedbackHtml(card, ok, showQuote, comboMsg) {
+    return '<div class="lesson-feedback ' + (ok ? 'is-ok' : 'is-ng') + '" role="status">' +
+        '<div class="lf-head">' + ic(ok ? 'check' : 'close') + '<strong>' + (ok ? '正解！' : '正解は') + '</strong>' +
+          (comboMsg ? '<span class="lf-combo">' + escapeHtml(comboMsg) + '</span>' : '') + '</div>' +
+        '<div class="lf-expr">' + escapeHtml(card.expression) +
+          (card.readingHint ? '<span class="lf-hint">' + escapeHtml(card.readingHint) + '</span>' : '') + '</div>' +
+        '<div class="lf-meaning">' + escapeHtml(card.meaningJa) + '</div>' +
+        (showQuote && card.quoteEn
+          ? '<div class="quiz-quote-mini">“' + highlightExpressionInQuote(card.quoteEn, card.expression) + '”' +
+            (card.quoteJa ? '<span class="qja">' + escapeHtml(card.quoteJa) + '</span>' : '') + '</div>'
+          : '') +
+        '<button class="btn-primary lesson-continue" type="button" id="lessonContinueBtn">つづける' + ic('chev-right') + '</button>' +
+      '</div>';
+  }
+
+  function renderLesson() {
+    var autoArmed = state.lessonAutoArm;
+    state.lessonAutoArm = false;
+    renderStudyViewVisibility();
+    var L = state.lesson;
+    var box = document.getElementById('lessonBody');
+    if (!L || !box) return;
+    renderLessonTopBar();
+    if (L.finished) { renderLessonResult(); return; }
+
+    // 消された単語は飛ばす（正解あつかい）
+    var card = findCardById(L.queue[L.pos].wordId);
+    while (!card && L.pos < L.queue.length) {
+      L.progress++;
+      L.pos++;
+      L.options = [];
+      L.answered = -1;
+      card = L.pos < L.queue.length ? findCardById(L.queue[L.pos].wordId) : null;
+    }
+    if (!card) { finishLesson(); return; }
+
+    var q = L.queue[L.pos];
+    if (!L.options.length) L.options = buildChoiceOptions(card, q.type, lessonWordIds(L));
+    var answered = L.answered !== -1;
+    var ok = answered && L.options[L.answered] && L.options[L.answered].isCorrect;
+    var isNewFirst = q.isIntro || (L.newIds[q.wordId] && !L.seenIds[q.wordId]);
+
+    var tags = '';
+    if (isNewFirst) tags += '<span class="lesson-tag is-new">新しい表現</span>';
+    if (q.retry) tags += '<span class="lesson-tag is-retry">もう一度</span>';
+
+    box.innerHTML =
+      '<article class="flashcard is-quiz lesson-card' + (answered ? ' no-anim' : '') + '">' +
+        '<div class="lesson-q-head"><span class="lesson-q-type">' + ic(LQ_ICON[q.type] || 'cards') + escapeHtml(LQ_LABEL[q.type] || '') + '</span>' + tags + '</div>' +
+        '<div class="card-stage">' + lessonPromptHtml(card, q.type, answered) + '</div>' +
+        lessonOptionsHtml(L.options, L.answered, q.type !== 'meaning') +
+        (answered ? lessonFeedbackHtml(card, ok, L.newIds[q.wordId] || !ok || q.type === 'cloze', ok && L.combo >= 5 && L.combo % 5 === 0 ? (L.combo + '問連続！') : '') : '') +
+      '</article>';
+
+    updatePlayerButtonsUi();
+    if (answered) {
+      var fb = box.querySelector('.lesson-feedback');
+      if (fb && fb.scrollIntoView) fb.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    // 出した問題の音声を流す（タップの流れの中なので iPhone でも鳴る）。
+    // 聞き取りの問題はいつも流す。日→英は答えがばれるので、答えたあとに流す
+    if (autoArmed && card.audioFile && q.type !== 'recall' && (q.type === 'listen' || state.cardAutoAudio)) {
+      stopAutoplayMode();
+      playClipObject(card, 'vocab', false, true);
+    }
+  }
+
+  function answerLesson(idx) {
+    var L = state.lesson;
+    if (!L || L.finished || L.answered !== -1) return;
+    var q = L.queue[L.pos];
+    var card = findCardById(q.wordId);
+    if (!card || !L.options[idx]) return;
+    L.answered = idx;
+    var ok = L.options[idx].isCorrect;
+    if (L.newIds[q.wordId] && !L.seenIds[q.wordId]) q.isIntro = true;   // 「新しい表現」の札は答えたあとも残す
+    L.seenIds[q.wordId] = true;
+    if (ok) {
+      L.progress++;
+      if (!q.retry) L.firstTry++;
+      L.combo++;
+      L.bestCombo = Math.max(L.bestCombo, L.combo);
+    } else {
+      L.mistakes++;
+      L.combo = 0;
+      L.wrongByWord[q.wordId] = (L.wrongByWord[q.wordId] || 0) + 1;
+      L.queue.push({ wordId: q.wordId, type: q.type, round: q.round, retry: true });
+    }
+    state.lessonCloseArmed = false;
+    // 日→英は、答えたら音声で確かめる
+    if (q.type === 'recall' && card.audioFile && state.cardAutoAudio) {
+      stopAutoplayMode();
+      playClipObject(card, 'vocab', false, true);
+    }
+    renderLesson();
+  }
+
+  function continueLesson() {
+    var L = state.lesson;
+    if (!L || L.finished || L.answered === -1) return;
+    pausePlayerQuietly();
+    L.pos++;
+    L.answered = -1;
+    L.options = [];
+    if (L.pos >= L.queue.length) { finishLesson(); return; }
+    state.lessonAutoArm = true;
+    renderLesson();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function finishLesson() {
+    var L = state.lesson;
+    if (!L || L.finished) return;
+    L.finished = true;
+    var results = [];
+    var newWords = 0;
+    lessonWordIds(L).forEach(function (id) {
+      var c = findCardById(id);
+      if (!c) return;
+      var wrong = L.wrongByWord[id] || 0;
+      var rating = '';
+      if (L.newIds[id]) {
+        newWords++;
+        rating = wrong === 0 ? 'good' : (wrong === 1 ? 'hard' : 'again');
+      } else if (wrong > 0) {
+        rating = 'again';
+      } else if (isDueClient(c)) {
+        rating = 'good';
+      }
+      if (rating) results.push({ id: id, rating: rating });
+    });
+    var seconds = Math.round((Date.now() - L.startedAt) / 1000);
+    var payload = {
+      id: 'lr_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8),
+      kind: L.kind,
+      creator: lessonCreatorKey(),
+      unit: L.unitNum,
+      slot: L.slotIdx,
+      total: L.total,
+      correct: L.firstTry,
+      mistakes: L.mistakes,
+      newWords: newWords,
+      seconds: seconds,
+      results: results
+    };
+    L.result = {
+      newWords: newWords,
+      accuracy: Math.round((L.firstTry / Math.max(1, L.total)) * 100),
+      seconds: seconds,
+      wordIds: lessonWordIds(L)
+    };
+    applyLessonLocally(payload);
+    savePendingLesson(payload);
+    sendLessonResult(payload);
+    pausePlayerQuietly();
+    renderLesson();
+    window.scrollTo({ top: 0 });
+  }
+
+  // 送る前に手元へ当てる（次のレッスン・復習の数・まとめテストの済みがすぐ分かるように）
+  function applyLessonLocally(payload) {
+    var at = Date.now();
+    state.recentReviews = (state.recentReviews || []).filter(function (r) { return at - r.at < 5 * 60 * 1000; });
+    payload.results.forEach(function (r) {
+      var c = findCardById(r.id);
+      if (!c) return;
+      var updated = Object.assign({}, c, calcNextSrsClient(c, r.rating));
+      replaceCardInState(updated);
+      // 読み込みの返事が届いても、この結果のほうが新しいので残す（裏方の返事が来たら、そちらで置きかわる）
+      state.recentReviews.push({ at: at, card: updated, stats: null });
+    });
+    var s = state.lessonSummary || { total: 0, today: 0, todayNewWords: 0, testsPassed: [] };
+    s = Object.assign({}, s, {
+      total: (Number(s.total) || 0) + 1,
+      today: (Number(s.today) || 0) + 1,
+      todayNewWords: (Number(s.todayNewWords) || 0) + payload.newWords,
+      testsPassed: (s.testsPassed || []).slice()
+    });
+    if (payload.kind === 'test') {
+      var key = payload.creator + '|' + payload.unit;
+      if (s.testsPassed.indexOf(key) === -1) s.testsPassed.push(key);
+    }
+    state.lessonSummary = s;
+    if (state.stats) {
+      state.stats = Object.assign({}, state.stats, { todayReviewed: (Number(state.stats.todayReviewed) || 0) + payload.results.length });
+    }
+    state.lessonWriteAt = Date.now();
+    renderHeaderAndStats();
+  }
+
+  function applyLessonResponse(data) {
+    if (!data) return;
+    (data.cards || []).forEach(function (c) {
+      replaceCardInState(c);
+      noteReviewSaved({ card: c, stats: data.stats });
+    });
+    if (data.stats) state.stats = data.stats;
+    if (data.lessonSummary) state.lessonSummary = data.lessonSummary;
+    state.lessonWriteAt = Date.now();
+    renderHeaderAndStats();
+    renderLibraryList();
+    if (state.studyView === 'groups') renderStudyGroups();
+  }
+
+  function readPendingLessons() {
+    try {
+      var arr = JSON.parse(safeStorageGet(LESSON_PENDING_KEY, '[]'));
+      return Array.isArray(arr) ? arr.filter(function (p) { return p && typeof p.id === 'string'; }) : [];
+    } catch (e) { return []; }
+  }
+  function writePendingLessons(arr) { safeStorageSet(LESSON_PENDING_KEY, JSON.stringify(arr.slice(-20))); }
+  function savePendingLesson(payload) {
+    var arr = readPendingLessons().filter(function (p) { return p.id !== payload.id; });
+    arr.push(payload);
+    writePendingLessons(arr);
+  }
+  function removePendingLesson(id) {
+    writePendingLessons(readPendingLessons().filter(function (p) { return p.id !== id; }));
+  }
+
+  var lessonSendingIds = {};
+  function postLessonResult(payload) {
+    if (lessonSendingIds[payload.id]) return Promise.resolve(true);   // いま送っている途中
+    lessonSendingIds[payload.id] = true;
+    state.reviewInFlight = (state.reviewInFlight || 0) + 1;
+    return callGas('apiFinishLesson', payload).then(function (data) {
+      delete lessonSendingIds[payload.id];
+      state.reviewInFlight--;
+      removePendingLesson(payload.id);
+      applyLessonResponse(data);
+      return true;
+    }, function (err) {
+      delete lessonSendingIds[payload.id];
+      state.reviewInFlight--;
+      // 裏方が古い（まだ apiFinishLesson がない）・合言葉が違う ときは、残しておいても送れないことを知らせる
+      if (err && err.code === 'unknown_action') showToast('裏方（Apps Script）の更新が必要です。レッスンの結果は端末に残しています', true);
+      return false;
+    });
+  }
+
+  function sendLessonResult(payload) {
+    state.reviewSendChain = state.reviewSendChain.then(function () {
+      return postLessonResult(payload).then(function (ok) {
+        if (!ok) showToast('レッスンの結果を送れませんでした。つながったときに自動で送ります', true);
+      });
+    });
+  }
+
+  // 前に送れなかった結果を送る（読み込みの前に呼ぶ。裏方は同じ id を二度数えない）
+  function flushPendingLessons() {
+    var list = readPendingLessons();
+    var p = Promise.resolve();
+    list.forEach(function (payload) {
+      p = p.then(function () { return postLessonResult(payload); });
+    });
+    return p;
+  }
+
+  function formatLessonTime(sec) {
+    var m = Math.floor(sec / 60);
+    var s = sec % 60;
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  function renderLessonResult() {
+    var L = state.lesson;
+    var box = document.getElementById('lessonBody');
+    var R = L.result || { newWords: 0, accuracy: 0, seconds: 0, wordIds: [] };
+    var path = buildLessonPath();
+    var next = path.next;
+    var isTest = L.kind === 'test';
+    var wordsHtml = R.wordIds.map(function (id) {
+      var c = findCardById(id);
+      if (!c) return '';
+      var wrong = L.wrongByWord[id] || 0;
+      return '<li class="lr-word' + (wrong ? ' is-weak' : '') + '">' +
+        '<span class="lr-expr">' + escapeHtml(c.expression) + '</span>' +
+        '<span class="lr-mean">' + escapeHtml(c.meaningJa) + '</span>' +
+        (L.newIds[id] ? '<span class="lr-badge is-new">新</span>' : '') +
+        (wrong ? '<span class="lr-badge is-weak">' + wrong + '回ミス</span>' : '') +
+      '</li>';
+    }).join('');
+    var nextLabel = next.kind === 'done' ? '' : lessonStepTitle(path, next);
+    var praise = R.accuracy >= 90 ? 'すばらしい出来です' : (R.accuracy >= 70 ? 'いい調子です' : 'おつかれさま。まちがえた語は復習に出ます');
+
+    box.innerHTML =
+      '<div class="card lesson-result">' +
+        '<img class="lesson-result-mascot" src="icon-180.png" alt="">' +
+        '<h3>' + (isTest ? 'まとめテスト かんりょう' : 'レッスン かんりょう') + '</h3>' +
+        '<p class="lr-sub">' + escapeHtml(L.title) + ' ・ ' + escapeHtml(praise) + '</p>' +
+        '<div class="lr-tiles">' +
+          '<div class="lr-tile"><span class="v">' + R.accuracy + '<small>%</small></span><span class="k">1回で正解</span></div>' +
+          '<div class="lr-tile"><span class="v">' + R.newWords + '</span><span class="k">新しい表現</span></div>' +
+          '<div class="lr-tile"><span class="v">' + formatLessonTime(R.seconds) + '</span><span class="k">かかった時間</span></div>' +
+        '</div>' +
+        (wordsHtml ? '<details class="lr-words-wrap"' + (isTest ? '' : ' open') + '><summary>' + (isTest ? 'テストに出た表現' : 'このレッスンの表現') + '（' + R.wordIds.length + '）</summary><ul class="lr-words">' + wordsHtml + '</ul></details>' : '') +
+        (next.kind === 'done'
+          ? '<p class="lr-done">この道のレッスンは全部おわりました。あとは復習で定着させましょう。</p>' +
+            '<button class="btn-primary" type="button" id="lessonGoReviewBtn">' + ic('calendar') + '復習する</button>'
+          : '<button class="btn-primary lesson-next-btn" type="button" id="lessonNextBtn">' +
+              '<span class="lnb-main">' + (next.kind === 'test' ? 'まとめテストへ' : '次のレッスンへ') + ic('chev-right') + '</span>' +
+              '<span class="lnb-sub">' + escapeHtml(nextLabel) + '（' + (next.kind === 'test' ? Math.min(UNIT_SIZE, (path.units[next.unitIdx] || { cards: [] }).cards.length) : LESSON_QUESTION_TARGET) + '問）</span>' +
+            '</button>') +
+        '<button class="btn-secondary" type="button" id="lessonEndBtn">おわる</button>' +
+      '</div>';
+  }
+
+  // 単語タブのいちばん上：勉強の道と、復習
+  function renderLessonHero(el) {
+    var path = buildLessonPath();
+    var next = path.next;
+    var unit = path.units[next.unitIdx];
+    if (!unit) { el.innerHTML = ''; return; }
+    var sum = state.lessonSummary || {};
+    var allDone = next.kind === 'done';
+
+    // ユニットの道：レッスン1〜4 と まとめテスト
+    var nodes = unit.slots.map(function (sl) {
+      var done = sl.newCount === 0;
+      var current = next.kind === 'lesson' && next.slotIdx === sl.idx;
+      var cls = 'path-node' + (done ? ' is-done' : '') + (current ? ' is-current' : '');
+      var locked = !done && !current;
+      return '<button class="' + cls + '" type="button" data-path-slot="' + sl.idx + '"' + (locked ? ' disabled' : '') +
+        ' aria-label="レッスン ' + (sl.idx + 1) + (done ? '（済み・もう一度）' : (current ? '（次）' : '（まだ）')) + '">' +
+        (done ? ic('check') : '<span>' + (sl.idx + 1) + '</span>') + '</button>';
+    });
+    var allSlotsDone = unit.newCount === 0;
+    var testPassed = isUnitTestPassed(unit.num) || unit.askable === 0;
+    var testCurrent = next.kind === 'test';
+    nodes.push('<button class="path-node is-test' + (testPassed ? ' is-done' : '') + (testCurrent ? ' is-current' : '') + '" type="button" data-path-test="1"' +
+      (allSlotsDone ? '' : ' disabled') + ' aria-label="まとめテスト' + (testPassed ? '（済み）' : '') + '">' + ic(testPassed ? 'check' : 'star') + '</button>');
+    var pathHtml = '<div class="lesson-path" role="group" aria-label="Unit ' + unit.num + ' の道">' +
+      nodes.join('<span class="path-link" aria-hidden="true"></span>') + '</div>';
+
+    var heading = allDone ? 'ぜんぶ学びました' : lessonStepTitle(path, next);
+    var startLabel = allDone ? '' : (next.kind === 'test'
+      ? 'まとめテストをはじめる（' + Math.min(UNIT_SIZE, unit.cards.length) + '問）'
+      : '勉強をはじめる（' + LESSON_QUESTION_TARGET + '問）');
+
+    var reviewDue = getCreatorVocabSortedByFreq().filter(isReviewDue).length;
+
+    el.innerHTML =
+      '<div class="today-hero lesson-hero">' +
+        '<div class="today-hero-top">' +
+          '<div>' +
+            '<div class="today-label">' + (allDone ? 'おつかれさまでした' : (next.kind === 'test' ? 'ユニットのしめくくり' : '次の勉強')) + '</div>' +
+            '<div class="lesson-hero-title">' + escapeHtml(heading) + '</div>' +
+            '<div class="today-sub"><span class="nw">学んだ表現 ' + path.studied + ' / ' + path.total + '</span>' +
+              (sum.today ? ' <span class="nw">・ 今日のレッスン ' + sum.today + '回</span>' : '') + '</div>' +
+          '</div>' +
+          '<img class="today-mascot" src="icon-180.png" alt="">' +
+        '</div>' +
+        pathHtml +
+        (allDone ? '' : '<button class="today-start" type="button" id="lessonStartBtn">' + ic('play') + escapeHtml(startLabel) + '</button>') +
+      '</div>' +
+      '<button class="review-strip' + (reviewDue ? '' : ' is-clear') + '" type="button" id="todayStartBtn"' + (reviewDue ? '' : ' disabled') + '>' +
+        '<span class="review-strip-ic">' + ic(reviewDue ? 'calendar' : 'check') + '</span>' +
+        '<span class="review-strip-main"><strong>' + (reviewDue ? '今日の復習 ' + reviewDue + '語' : '今日の復習はおわり') + '</strong>' +
+          '<span>' + (reviewDue ? '学んだ表現で、復習の時期が来たもの' : '新しいレッスンで表現を増やしましょう') + '</span></span>' +
+        (reviewDue ? '<span class="review-strip-go">復習する' + ic('chev-right') + '</span>' : '') +
+      '</button>';
+
+    var startBtn = document.getElementById('lessonStartBtn');
+    if (startBtn) startBtn.addEventListener('click', function () { startLesson(buildLessonPath().next); });
+    document.getElementById('todayStartBtn').addEventListener('click', function () { openStudyGroup('smart_due'); });
+    var pathEl = el.querySelector('.lesson-path');
+    pathEl.addEventListener('click', function (ev) {
+      var b = ev.target.closest('.path-node');
+      if (!b || b.disabled) return;
+      var p = buildLessonPath();
+      var stepUnitIdx = p.next.unitIdx;
+      if (b.hasAttribute('data-path-test')) startLesson({ kind: 'test', unitIdx: stepUnitIdx, slotIdx: -1 });
+      else startLesson({ kind: 'lesson', unitIdx: stepUnitIdx, slotIdx: parseInt(b.getAttribute('data-path-slot'), 10) || 0 });
+    });
+  }
+
+  function bindLessonEvents() {
+    var view = document.getElementById('lessonView');
+    if (!view) return;
+    view.addEventListener('click', function (ev) {
+      var t = ev.target;
+      var choice = t.closest('[data-choice-idx]');
+      if (choice && !choice.disabled) { answerLesson(parseInt(choice.getAttribute('data-choice-idx'), 10)); return; }
+      if (t.closest('#lessonContinueBtn')) { continueLesson(); return; }
+      var playBtn = t.closest('#lessonPlayBtn');
+      if (playBtn && !playBtn.disabled) {
+        var card = findCardById(lessonCurrentCardId());
+        if (!card) return;
+        var isThisPlaying = state.activeClipType === 'vocab' && state.activeCardId === card.id && state.playerStatus === 'playing';
+        stopAutoplayMode();
+        if (isThisPlaying) pausePlayerQuietly();
+        else playClipObject(card, 'vocab', false, true);
+        return;
+      }
+      if (t.closest('#lessonSpeedBtn')) {
+        var idx = SPEED_STEPS.indexOf(state.playbackRate);
+        state.playbackRate = SPEED_STEPS[(idx + 1) % SPEED_STEPS.length];
+        safeStorageSet('saba_speed', state.playbackRate);
+        if (state.audioEl) state.audioEl.playbackRate = state.playbackRate;
+        updatePlayerButtonsUi();
+        return;
+      }
+      if (t.closest('#lessonNextBtn')) { startLesson(buildLessonPath().next); return; }
+      if (t.closest('#lessonEndBtn')) { exitLesson(); return; }
+      if (t.closest('#lessonGoReviewBtn')) { state.lesson = null; openStudyGroup('smart_due'); return; }
+      if (t.closest('#lessonCloseBtn')) {
+        var L = state.lesson;
+        // 終わったあと・まだ1問も答えていないときは、すぐ閉じる。途中なら2回押しで（進みは残らない）
+        if (!L || L.finished || (L.pos === 0 && L.answered === -1)) { exitLesson(); return; }
+        if (state.lessonCloseArmed) { exitLesson(); return; }
+        state.lessonCloseArmed = true;
+        renderLessonTopBar();
+        showToast('もう一度押すとやめます（このレッスンの答えは残りません）');
+        clearTimeout(state.lessonCloseTimer);
+        state.lessonCloseTimer = setTimeout(function () { state.lessonCloseArmed = false; renderLessonTopBar(); }, 3000);
+      }
+    });
+  }
+
+  /* ============================================================
+   * 単語：4択・穴埋め
+   * ============================================================ */
   function prefetchUpcomingStudyAudio() {
     var localWarm = [];
     var netPrefetch = [];
@@ -1980,7 +2782,7 @@
       return limit ? copy.slice(0, limit) : copy;
     }
 
-    var dueCards = allSorted.filter(isDueClient);
+    var dueCards = allSorted.filter(isReviewDue);
     var top50 = allSorted.slice(0, 50);
     var basicCards = allSorted.filter(function (c) { return c.level === 'Basic'; });
     var phrasalCards = allSorted.filter(function (c) { return c.category === 'Phrasal Verb' || c.category === 'Idiom'; });
@@ -2000,7 +2802,7 @@
     }
 
     var smart = [
-      makeSmart('smart_due', '今日の復習（20語）', '復習タイミングが来ている単語', takePriority(dueCards, 20), true),
+      makeSmart('smart_due', '今日の復習（20語）', '学んだ単語で、復習の時期が来たもの', takePriority(dueCards, 20), true),
       makeSmart('smart_top50', '超頻出 TOP 50', '配信で最もよく聞く 50 語', top50, true),
       makeSmart('smart_basic', '日常の基本 (Basic)', 'まずはここから・基本 30 語', takePriority(basicCards, 30), false),
       makeSmart('smart_phrasal', '句動詞・熟語', 'ネイティブらしい定番 30 語', takePriority(phrasalCards, 30), false),
@@ -2016,10 +2818,13 @@
   function renderStudyViewVisibility() {
     var gView = document.getElementById('studyGroupView');
     var sView = document.getElementById('studySessionView');
-    if (!gView || !sView) return;
-    var inSession = state.studyView === 'session';
-    gView.style.display = inSession ? 'none' : 'block';
-    sView.style.display = inSession ? 'block' : 'none';
+    var lView = document.getElementById('lessonView');
+    if (!gView || !sView || !lView) return;
+    gView.style.display = state.studyView === 'groups' ? 'block' : 'none';
+    sView.style.display = state.studyView === 'session' ? 'block' : 'none';
+    lView.style.display = state.studyView === 'lesson' ? 'block' : 'none';
+    // レッスン中は上の見出しと下のタブを隠して、問題だけにする（Duolingo と同じ）
+    document.body.classList.toggle('in-lesson', state.studyView === 'lesson');
   }
 
   function showStudyGroupPicker() {
@@ -2088,36 +2893,12 @@
     }).join('');
   }
 
-  // いちばん上の「今日の復習」
+  // いちばん上の「勉強をはじめる」と「今日の復習」
   function renderTodayHero() {
     var el = document.getElementById('studyTodayHero');
     if (!el) return;
     if (state.vocab.length === 0) { el.innerHTML = ''; return; }
-    var st = state.stats || { todayReviewed: 0, dailyGoal: 25 };
-    var dueCount = getCreatorVocabSortedByFreq().filter(isDueClient).length;
-    var goal = Math.max(1, Number(st.dailyGoal) || 25);
-    var done = Number(st.todayReviewed) || 0;
-    var clear = dueCount === 0;
-    el.innerHTML =
-      '<div class="today-hero' + (clear ? ' is-clear' : '') + '">' +
-        '<div class="today-hero-top">' +
-          '<div>' +
-            '<div class="today-label">' + (clear ? '今日の復習はおわり' : '今日の復習') + '</div>' +
-            '<div class="today-count"><span class="num">' + (clear ? done : dueCount) + '</span><span class="unit">' + (clear ? '枚 できた' : '語') + '</span></div>' +
-            '<div class="today-sub">' + (clear
-              ? 'おつかれさま。次は新しいユニットへ'
-              : ('今日 ' + done + ' / ' + goal + ' 枚 ・ 1回 20 語ずつ')) + '</div>' +
-          '</div>' +
-          '<img class="today-mascot" src="icon-180.png" alt="">' +
-        '</div>' +
-        '<button class="today-start" type="button" id="todayStartBtn">' + ic(clear ? 'cards' : 'play') + (clear ? '新しいユニットへ' : '復習をはじめる') + '</button>' +
-      '</div>';
-    document.getElementById('todayStartBtn').addEventListener('click', function () {
-      if (!clear) { openStudyGroup('smart_due'); return; }
-      var built = buildStudyGroups();
-      var next = built.units.find(function (u) { return u.learned < u.total; }) || built.units[0];
-      if (next) openStudyGroup(next.id);
-    });
+    renderLessonHero(el);
   }
 
   function openStudyGroup(groupId, customStreamVid) {
@@ -2164,6 +2945,7 @@
       updateStudyUndoButton();
       return;
     }
+    if (state.studyView === 'lesson') return;
     state.studyView = 'groups';
     renderStudyViewVisibility();
     renderStudyGroups();
@@ -2206,7 +2988,7 @@
       progFill.style.width = pct + '%';
     }
 
-    streakBadge.style.display = state.studyMode === 'quiz' && state.quizStreak > 0 ? 'inline-flex' : 'none';
+    streakBadge.style.display = state.quizStreak > 0 ? 'inline-flex' : 'none';
     streakBadge.innerHTML = ic('flame') + '<span>' + state.quizStreak + '</span>';
 
     while (state.studyIndex < state.studyQueueIds.length && !findCardById(state.studyQueueIds[state.studyIndex])) {
@@ -2307,139 +3089,91 @@
       updatePlayerButtonsUi();
     }
 
-    // === 4択辞書クイズモード（1画面ゼロスクロール完結） ===
-    if (state.studyMode === 'quiz') {
-      if (state.quizOptions.length === 0) {
-        state.quizOptions = buildQuizOptionsForCard(card);
-      }
-      var answered = state.quizAnsweredIdx !== -1;
-      var keys = ['A', 'B', 'C', 'D'];
-
-      var optsHtml = '<div class="quiz-options">' + state.quizOptions.map(function (opt, idx) {
-        var cls = 'quiz-opt-btn';
-        if (answered) {
-          if (opt.isCorrect) cls += ' correct';
-          else if (idx === state.quizAnsweredIdx) cls += ' wrong';
-          else cls += ' dimmed';
-        }
-        return '<button class="' + cls + '" type="button" data-quiz-idx="' + idx + '"' + (answered ? ' disabled' : '') + '>' +
-          '<span class="quiz-opt-key">' + keys[idx] + '</span>' +
-          '<span class="quiz-opt-text">' + escapeHtml(opt.meaningJa) + '</span>' +
-        '</button>';
-      }).join('') + '</div>';
-
-      var quizResultHtml = '';
-      if (answered) {
-        quizResultHtml =
-          '<div class="quiz-result-compact">' +
-            (card.quoteEn
-              ? '<div class="quiz-quote-mini">“' + highlightExpressionInQuote(card.quoteEn, card.expression) + '”' +
-                (card.quoteJa ? '<span class="qja">' + escapeHtml(card.quoteJa) + '</span>' : '') + '</div>'
-              : '') +
-            '<div class="quiz-next-row">' +
-              '<button class="btn-secondary" type="button" id="quizDetailBtn">くわしく</button>' +
-              '<button class="btn-primary" type="button" id="quizNextBtn">次へ' + ic('chev-right') + '</button>' +
-            '</div>' +
-          '</div>';
-      }
-
-      container.innerHTML =
-        '<article class="flashcard is-quiz' + (sameCard ? ' no-anim' : '') + '">' +
-          cardHeadHtml +
-          '<div class="card-stage">' +
-            '<div class="card-expression">' + escapeHtml(card.expression) + '</div>' +
-            inlineAudioRowHtml +
-          '</div>' +
-          optsHtml +
-          quizResultHtml +
-        '</article>';
-
-      wireInlineStudyAudio();
-      maybeAutoPlayStudyCard(card, sameCard, autoArmed);
-
-      var qBtns = container.querySelectorAll('[data-quiz-idx]');
-      for (var q = 0; q < qBtns.length; q++) {
-        qBtns[q].addEventListener('click', function () {
-          var idx = parseInt(this.getAttribute('data-quiz-idx'), 10);
-          state.quizAnsweredIdx = idx;
-          var ok = state.quizOptions[idx] && state.quizOptions[idx].isCorrect;
-          state.quizStreak = ok ? (state.quizStreak + 1) : 0;
-          renderStudyCard();
-          recordQuizOutcome(card, ok ? 'good' : 'again');
-        });
-      }
-      var nextBtn = document.getElementById('quizNextBtn');
-      if (nextBtn) {
-        nextBtn.addEventListener('click', function () {
-          pausePlayerQuietly();
-          state.studyIndex++;
-          state.quizAnsweredIdx = -1;
-          state.quizOptions = [];
-          state.cardAutoAudioArm = true;
-          renderStudyCard();
-        });
-      }
-      var detailBtn = document.getElementById('quizDetailBtn');
-      if (detailBtn) {
-        detailBtn.addEventListener('click', function () { openDetailModal(card, false); });
-      }
-      return;
+    // === 4択（意味を選ぶ）／穴埋め（配信のセリフの空所に入る表現を選ぶ） ===
+    // 穴埋めは、セリフに表現が入っていないときは「聞いて選ぶ」、音声もなければ「英語で言うと」に置きかえる
+    var qType = state.studyMode === 'listening'
+      ? (canCloze(card) ? 'cloze' : (card.audioFile ? 'listen' : 'recall'))
+      : 'meaning';
+    if (state.quizOptions.length === 0) {
+      state.quizOptions = buildChoiceOptions(card, qType, state.studyQueueIds.slice(state.studyIndex, state.studyIndex + 8));
     }
+    var answered = state.quizAnsweredIdx !== -1;
 
-    // === 通常カード / リスニング穴埋めモード（1画面スッキリ完結） ===
-    var isListen = state.studyMode === 'listening';
-    var frontHtml;
-    if (isListen && !state.cardRevealed) {
-      var clozeHtml = buildClozeQuoteHtml(card.quoteEn, card.expression);
-      frontHtml =
+    var stageHtml;
+    if (qType === 'meaning') {
+      stageHtml = '<div class="card-expression">' + escapeHtml(card.expression) + '</div>' + inlineAudioRowHtml;
+    } else if (qType === 'cloze') {
+      stageHtml =
         '<div class="listening-mask">' +
-          '<div class="listening-label">' + ic('headphones') + '聴いて、空いているところを当てよう</div>' +
-          (clozeHtml ? '<div class="cloze-prompt">' + clozeHtml + '</div>' : '<div class="cloze-empty">下のボタンで音声を聴いてください</div>') +
-        '</div>';
+          '<div class="listening-label">' + ic('headphones') + '聴いて、空いているところに入る表現を選ぼう</div>' +
+          '<div class="cloze-prompt">' + (answered
+            ? '“' + highlightExpressionInQuote(card.quoteEn, card.expression) + '”'
+            : buildClozeQuoteHtml(card.quoteEn, card.expression)) + '</div>' +
+          (card.quoteJa ? '<div class="lesson-cloze-ja">' + escapeHtml(card.quoteJa) + '</div>' : '') +
+        '</div>' + inlineAudioRowHtml;
+    } else if (qType === 'listen') {
+      stageHtml =
+        '<div class="lesson-listen-stage">' + (answered
+          ? '<div class="card-expression is-small">' + escapeHtml(card.expression) + '</div>'
+          : '<div class="lesson-listen-hint">' + ic('headphones') + '音声を聞いて、聞こえた表現を選んでください</div>') +
+        '</div>' + inlineAudioRowHtml;
     } else {
-      frontHtml = '<div class="card-expression">' + escapeHtml(card.expression) + '</div>';
+      stageHtml = '<p class="lesson-ja-prompt">' + escapeHtml(card.meaningJa) + '</p>' + inlineAudioRowHtml;
     }
 
-    var answerHtml = state.cardRevealed
-      ? '<div class="answer-area">' +
-          (isListen ? '<div class="card-expression is-small">' + escapeHtml(card.expression) + '</div>' : '') +
-          '<p class="meaning-ja">' + escapeHtml(card.meaningJa) + '</p>' +
-          (card.quoteEn
+    var quizResultHtml = '';
+    if (answered) {
+      quizResultHtml =
+        '<div class="quiz-result-compact">' +
+          (qType !== 'meaning' ? '<p class="meaning-ja is-compact">' + escapeHtml(card.meaningJa) + '</p>' : '') +
+          (qType !== 'cloze' && card.quoteEn
             ? '<div class="quiz-quote-mini">“' + highlightExpressionInQuote(card.quoteEn, card.expression) + '”' +
               (card.quoteJa ? '<span class="qja">' + escapeHtml(card.quoteJa) + '</span>' : '') + '</div>'
             : '') +
-          '<div class="rating-grid">' +
-            '<button class="rate-btn rate-again" type="button" data-rate="again">もう1回<small>' + previewNextIntervalLabel(card, 'again') + '</small></button>' +
-            '<button class="rate-btn rate-hard" type="button" data-rate="hard">あいまい<small>' + previewNextIntervalLabel(card, 'hard') + '</small></button>' +
-            '<button class="rate-btn rate-good" type="button" data-rate="good">覚えた<small>' + previewNextIntervalLabel(card, 'good') + '</small></button>' +
-            '<button class="rate-btn rate-easy" type="button" data-rate="easy">完璧<small>' + previewNextIntervalLabel(card, 'easy') + '</small></button>' +
+          '<div class="quiz-next-row">' +
+            '<button class="btn-secondary" type="button" id="quizDetailBtn">くわしく</button>' +
+            '<button class="btn-primary" type="button" id="quizNextBtn">次へ' + ic('chev-right') + '</button>' +
           '</div>' +
-          '<button class="card-detail-link" type="button" id="studyCardDetailBtn">発音のコツ・くわしい説明' + ic('chev-right') + '</button>' +
-        '</div>'
-      : '<button class="reveal-btn" type="button" id="revealAnswerBtn">答えを見る</button>';
+        '</div>';
+    }
 
     container.innerHTML =
-      '<article class="flashcard' + (state.cardRevealed ? ' is-revealed' : '') + (sameCard ? ' no-anim' : '') + '">' +
+      '<article class="flashcard is-quiz' + (sameCard ? ' no-anim' : '') + '">' +
         cardHeadHtml +
-        '<div class="card-stage">' +
-          frontHtml +
-          inlineAudioRowHtml +
-        '</div>' +
-        answerHtml +
+        '<div class="card-stage">' + stageHtml + '</div>' +
+        lessonOptionsHtml(state.quizOptions, state.quizAnsweredIdx, qType !== 'meaning') +
+        quizResultHtml +
       '</article>';
 
     wireInlineStudyAudio();
     maybeAutoPlayStudyCard(card, sameCard, autoArmed);
 
-    var revealBtn = document.getElementById('revealAnswerBtn');
-    if (revealBtn) revealBtn.addEventListener('click', function () { state.cardRevealed = true; renderStudyCard(); });
-
-    var cardDetailBtn = document.getElementById('studyCardDetailBtn');
-    if (cardDetailBtn) cardDetailBtn.addEventListener('click', function () { openDetailModal(card, false); });
-
-    var rateBtns = container.querySelectorAll('[data-rate]');
-    for (var i = 0; i < rateBtns.length; i++) {
-      rateBtns[i].addEventListener('click', function () { submitStudyRating(card, this.getAttribute('data-rate')); });
+    var qBtns = container.querySelectorAll('[data-choice-idx]');
+    for (var q = 0; q < qBtns.length; q++) {
+      qBtns[q].addEventListener('click', function () {
+        if (state.quizAnsweredIdx !== -1) return;
+        var idx = parseInt(this.getAttribute('data-choice-idx'), 10);
+        state.quizAnsweredIdx = idx;
+        var ok = state.quizOptions[idx] && state.quizOptions[idx].isCorrect;
+        state.quizStreak = ok ? (state.quizStreak + 1) : 0;
+        renderStudyCard();
+        recordQuizOutcome(card, ok ? 'good' : 'again');
+      });
+    }
+    var nextBtn = document.getElementById('quizNextBtn');
+    if (nextBtn) {
+      nextBtn.addEventListener('click', function () {
+        pausePlayerQuietly();
+        state.studyIndex++;
+        state.quizAnsweredIdx = -1;
+        state.quizOptions = [];
+        state.cardAutoAudioArm = true;
+        renderStudyCard();
+      });
+    }
+    var detailBtn = document.getElementById('quizDetailBtn');
+    if (detailBtn) {
+      detailBtn.addEventListener('click', function () { openDetailModal(card, false); });
     }
   }
 
@@ -2498,26 +3232,6 @@
           showToast('記録できませんでした：' + err.message, true);
         });
     });
-  }
-
-  function submitStudyRating(card, rating) {
-    stopAutoplayMode();
-    pausePlayerQuietly();
-    flushPendingReview();
-
-    var prevIndex = state.studyIndex;
-    var appendedAgain = false;
-    if (rating === 'again') { state.studyQueueIds.push(card.id); appendedAgain = true; }
-    var entry = { prevIndex: prevIndex, cardId: card.id, rating: rating, appendedAgain: appendedAgain };
-    state.studyHistory.push(entry);
-    state.pendingReview = entry;
-    state.pendingReviewTimerId = setTimeout(flushPendingReview, 3500);
-
-    state.studyIndex++;
-    state.cardRevealed = false;
-    updateStudyUndoButton();
-    state.cardAutoAudioArm = true;
-    renderStudyCard();
   }
 
   function toggleCardFavorite(card) {
@@ -3090,6 +3804,7 @@
     state.audioFolderStatus = data.audioFolderStatus || { ready: false, folderName: 'SabaAudioClips' };
     state.seedSummary = data.seedSummary || { available: false };
     if (Array.isArray(data.listeningLogs)) state.listeningLogs = data.listeningLogs;
+    if (data.lessonSummary) state.lessonSummary = data.lessonSummary;
 
     renderCreatorSelects();
     renderListeningLogs();
@@ -3100,9 +3815,10 @@
     renderStreamsList();
     renderSettingsForm();
     // 練習の途中なら、並びはそのままにして（表示中のカードを入れ替えない）、次のカードから新しいデータを使う
+    // レッスンの途中も、出している問題はそのまま
     if (state.studyView === 'session') {
       updateStudyUndoButton();
-    } else {
+    } else if (state.studyView === 'groups') {
       renderStudyGroups();
     }
   }
@@ -3125,6 +3841,7 @@
     // 送っている途中の評価を先に送りきってから取りに行く（古いデータで上書きしないため）
     flushPendingReview();
     return state.reviewSendChain
+      .then(flushPendingLessons)   // 前に送れなかったレッスンの結果を先に送る
       .then(function () {
         startedAt = Date.now();
         return callGas('apiGetBootstrapData');
@@ -3141,6 +3858,7 @@
         });
         // 取りに行っている間に聞き取りの記録を足した・消したなら、手元のほうが新しい
         if (state.listeningWriteAt && state.listeningWriteAt >= startedAt) data.listeningLogs = state.listeningLogs;
+        if (state.lessonWriteAt && state.lessonWriteAt >= startedAt) data.lessonSummary = state.lessonSummary;
         state.freshLoaded = true;
         state.bootFailed = false;
         state.lastSyncAt = Date.now();
@@ -3389,14 +4107,14 @@
       renderShadowTab();
     });
 
-    // 練習のしかた（カード・4択・穴埋め）
+    // 練習のしかた（4択・穴埋め）
     function setStudyMode(mode) {
       state.studyMode = mode;
       state.cardRevealed = false;
       state.quizAnsweredIdx = -1;
       state.quizOptions = [];
-      ['modeNormalBtn', 'modeQuizBtn', 'modeListenBtn'].forEach(function (id) {
-        var active = (id === 'modeNormalBtn' && mode === 'normal') || (id === 'modeQuizBtn' && mode === 'quiz') || (id === 'modeListenBtn' && mode === 'listening');
+      ['modeQuizBtn', 'modeListenBtn'].forEach(function (id) {
+        var active = (id === 'modeQuizBtn' && mode === 'quiz') || (id === 'modeListenBtn' && mode === 'listening');
         var el = document.getElementById(id);
         el.classList.toggle('active', active);
         el.setAttribute('aria-selected', String(active));
@@ -3404,9 +4122,9 @@
       state.cardAutoAudioArm = true;
       renderStudyCard();
     }
-    document.getElementById('modeNormalBtn').addEventListener('click', function () { setStudyMode('normal'); });
     document.getElementById('modeQuizBtn').addEventListener('click', function () { setStudyMode('quiz'); });
     document.getElementById('modeListenBtn').addEventListener('click', function () { setStudyMode('listening'); });
+    bindLessonEvents();
 
     // Study Group Picker & Back Button
     document.getElementById('groupTabUnitsBtn').addEventListener('click', function () {
@@ -3432,24 +4150,6 @@
     document.getElementById('shadowBackToPracticeBtn').addEventListener('click', function () {
       state.shadowView = 'practice';
       renderShadowTab();
-    });
-
-    document.getElementById('studyUndoBtn').addEventListener('click', function () {
-      if (state.studyHistory.length === 0) return;
-      var prev = state.studyHistory.pop();
-      var canceled = false;
-      if (state.pendingReview && state.pendingReview === prev) {
-        if (state.pendingReviewTimerId) { clearTimeout(state.pendingReviewTimerId); state.pendingReviewTimerId = null; }
-        state.pendingReview = null;
-        canceled = true;
-      }
-      if (prev.appendedAgain && state.studyQueueIds[state.studyQueueIds.length - 1] === prev.cardId) state.studyQueueIds.pop();
-      state.studyIndex = prev.prevIndex;
-      state.cardRevealed = false;
-      updateStudyUndoButton();
-      state.cardAutoAudioArm = true;
-      renderStudyCard();
-      showToast(canceled ? '答えを取り消しました' : '前のカードに戻りました');
     });
 
     // Passage list & modal
@@ -3786,7 +4486,7 @@
   function isSafeToReload() {
     var ae = document.activeElement;
     var typing = ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName);
-    return state.studyView !== 'session' && state.playerStatus !== 'playing' && !state.autoplayActive &&
+    return state.studyView === 'groups' && state.playerStatus !== 'playing' && !state.autoplayActive &&
       !state.bulkDownloadRunning && !state.isExtracting && !document.querySelector('.modal-backdrop.open') &&
       !state.pendingReview && !(state.reviewInFlight > 0) && !typing &&
       document.getElementById('setupScreen').hidden;

@@ -18,7 +18,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lexend:wght@400;500;600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
-<link rel="stylesheet" href="styles.css?v=2026-11-24_0115">
+<link rel="stylesheet" href="styles.css?v=2026-11-25_1527">
 <script>
   // 表示テーマ（自動・明るい・暗い）を描画の前に決める
   try { var t = localStorage.getItem('saba_theme'); if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t); } catch (e) {}
@@ -116,12 +116,10 @@
       <div id="studySessionView" style="display:none;">
         <div class="study-compact-bar">
           <button class="study-back-btn" id="studyBackToGroupsBtn" type="button"><i data-ic="chev-left"></i>一覧</button>
-          <div class="seg-3 compact" role="tablist" aria-label="練習のしかた">
-            <button class="seg-btn active" id="modeNormalBtn" type="button" role="tab" aria-selected="true">カード</button>
-            <button class="seg-btn" id="modeQuizBtn" type="button" role="tab" aria-selected="false">4択</button>
+          <div class="seg-2 compact" role="tablist" aria-label="練習のしかた">
+            <button class="seg-btn active" id="modeQuizBtn" type="button" role="tab" aria-selected="true">4択</button>
             <button class="seg-btn" id="modeListenBtn" type="button" role="tab" aria-selected="false">穴埋め</button>
           </div>
-          <button class="study-icon-mini" id="studyUndoBtn" type="button" disabled title="1つ前に戻る" aria-label="1つ前に戻る"><i data-ic="undo"></i></button>
         </div>
         <div class="study-progress-line">
           <span class="study-group-chip" id="studyActiveGroupLabel">Unit 1</span>
@@ -130,6 +128,17 @@
           <span class="quiz-streak-pill" id="quizStreakBadge" style="display:none;"></span>
         </div>
         <div id="studyCardContainer"></div>
+      </div>
+
+      <!-- 勉強をはじめる（レッスン20問） -->
+      <div id="lessonView" style="display:none;">
+        <div class="lesson-top-bar">
+          <button class="lesson-close-btn" id="lessonCloseBtn" type="button" aria-label="レッスンをやめる"><i data-ic="close"></i></button>
+          <div class="study-session-progress lesson-progress" aria-hidden="true"><div class="study-session-progress-fill" id="lessonProgressFill"></div></div>
+          <span class="study-progress-text" id="lessonProgressText">0 / 20</span>
+          <span class="quiz-streak-pill" id="lessonComboBadge" style="display:none;"></span>
+        </div>
+        <div id="lessonBody"></div>
       </div>
     </section>
 
@@ -533,8 +542,8 @@
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
-  if (/[?&]demo=1(&|$)/.test(location.search)) document.write('<script src="demo.js?v=2026-11-24_0115"><\/script>');
+  if (/[?&]demo=1(&|$)/.test(location.search)) document.write('<script src="demo.js?v=2026-11-25_1527"><\/script>');
 </script>
-<script src="app.js?v=2026-11-24_0115"></script>
+<script src="app.js?v=2026-11-25_1527"></script>
 </body>
 </html>

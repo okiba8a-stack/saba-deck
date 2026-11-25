@@ -356,6 +356,30 @@
     return dbListening.slice().sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : (a.createdAt < b.createdAt ? -1 : 1); });
   }
 
+  // レッスンの記録（シート LessonLog の代わり）
+  var dbLessons = [
+    { id: 'lr_demo_a', date: demoDate(1), kind: 'lesson', creator: 'all', unit: 1, newWords: 5 }
+  ];
+  function lessonSummary() {
+    var today = demoDate(0);
+    var passed = {};
+    var out = { total: dbLessons.length, today: 0, todayNewWords: 0, testsPassed: [] };
+    dbLessons.forEach(function (l) {
+      if (l.date === today) { out.today++; out.todayNewWords += l.newWords || 0; }
+      if (l.kind === 'test') passed[l.creator + '|' + l.unit] = true;
+    });
+    out.testsPassed = Object.keys(passed);
+    return out;
+  }
+  function applyDemoRating(c, rating) {
+    if (rating === 'again') c.lapses = (c.lapses || 0) + 1;
+    c.reps = rating === 'again' ? 0 : ((c.reps || 0) + 1);
+    c.intervalDays = rating === 'again' ? 0 : (rating === 'easy' ? 7 : (rating === 'hard' ? 1 : 4));
+    c.status = c.intervalDays >= 21 ? 'mastered' : 'learning';
+    c.lastReviewedAt = new Date().toISOString();
+    c.nextReviewAt = new Date(Date.now() + (rating === 'again' ? 600000 : c.intervalDays * 86400000)).toISOString();
+  }
+
   function computeStats() {
     var due = 0, mastered = 0, learning = 0, nw = 0, weak = 0;
     var byLevel = { Basic: 0, Natural: 0, Slang: 0 };
@@ -403,6 +427,19 @@
       dbListening = dbListening.filter(function (l) { return l.id !== id; });
       return { ok: true, data: { logs: listeningSorted() } };
     },
+    apiFinishLesson: function (payload) {
+      if (!payload || !/^lr_[a-z0-9_]{4,40}$/.test(String(payload.id || ''))) return { ok: false, error: 'レッスンの結果の id が正しくありません。' };
+      var dup = dbLessons.some(function (l) { return l.id === payload.id; });
+      var cards = [];
+      (payload.results || []).forEach(function (r) {
+        var c = dbVocab.find(function (x) { return x.id === r.id; });
+        if (!c) return;
+        if (!dup) { applyDemoRating(c, r.rating); todayReviewed++; }
+        cards.push(Object.assign({}, c));
+      });
+      if (!dup) dbLessons.push({ id: payload.id, date: demoDate(0), kind: payload.kind === 'test' ? 'test' : 'lesson', creator: payload.creator || 'all', unit: payload.unit, newWords: payload.newWords || 0 });
+      return { ok: true, data: { cards: cards, stats: computeStats(), lessonSummary: lessonSummary(), duplicate: dup } };
+    },
     apiGetBootstrapData: function () {
       return {
         ok: true,
@@ -412,6 +449,7 @@
           streams: dbStreams.slice(),
           stats: computeStats(),
           listeningLogs: listeningSorted(),
+          lessonSummary: lessonSummary(),
           settings: Object.assign({}, dbSettings),
           apiKeyStatus: { configured: true, masked: 'AQ.A••••••••Demo' },
           triggerStatus: { enabled: triggerEnabled },
